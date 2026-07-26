@@ -1,31 +1,3 @@
-"""
-ytdlp_api - yt-dlp を使ったシンプルな動画情報/ストリーム/HLS配信API
-UIなし、API専用。Termux + ngrok での運用を想定。
-
-エンドポイント:
-  GET  /api/info/{video_id}                  動画情報 + フォーマット一覧
-  GET  /api/stream/{video_id}                 サーバー経由でのプロキシ再生(Range/シーク対応)
-  GET  /api/hls/{video_id}                    リアルタイムHLS変換した再生リスト(m3u8)を返す。無ければ自動で変換開始
-  GET  /api/hls/{video_id}/{filename}         m3u8 / tsセグメントの配信(HLSプレイヤーが内部的に叩く)
-  POST /api/hls/{video_id}/stop               変換ジョブ停止・一時ファイル削除
-  GET  /api/health                            死活監視
-  GET  /api/stats                             worker数・処理中件数・キャッシュ件数・稼働時間をまとめて返す
-  GET  /api/workers                           このサーバー(worker)の情報一覧
-  GET  /api/processing                        現在処理中のvideo_id一覧(経過時間つき)
-  GET  /api/cache                             これまでに解決した動画のキャッシュ一覧(Video ID / Title)
-  GET  /api/cache/{video_id}                  キャッシュ済みの単一動画の情報
-  DELETE /api/cache/{video_id}                 キャッシュから削除
-
-video_id には
-  - YouTubeの動画ID (例: dQw4w9WgXcQ)
-  - もしくはURLエンコードした完全なURL (例: https%3A%2F%2Fvimeo.com%2F12345)
-のどちらも指定できます。単純な文字列(URLでない)場合は自動的に
-https://www.youtube.com/watch?v={video_id} として扱われます。
-
-共通クエリパラメータ:
-  format_id (省略可、デフォルト "best")  yt-dlpのフォーマット指定と同じ書式
-"""
-
 import os
 import re
 import time
