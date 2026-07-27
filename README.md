@@ -1,25 +1,21 @@
-画像のログを確認しました！2つのエラーが発生しています。
- * ERROR 404: Not Found 先ほどのURL（古い/形式変更されたリンク）が存在しなくなっているため、ファイルのダウンロードに失敗しています。そのため、その後の tar コマンドで「そんなファイルはありません（No such file or directory）」とエラーが出ています。
- * TermuxでのTurbolink/公式パッケージの利用 Termuxでは、公式リポジトリから pkg や tur-repo 経由でインストールするか、ngrokの最新直リンクからダウンロードするのが一番確実でエラーが起きにくいです。
-解決方法：以下のコマンドを1行ずつ順番に実行してください
-一番簡単で確実なのは curl コマンドで最新版を直接ダウンロードして展開する方法です。
-以下のコマンドを1行ずつコピー＆ペーストして実行してください：
-1. 古い不要なファイルを削除
+ログを確認しました！失敗の原因が分かりました。
+curl でダウンロードした際に 112バイト（エラーのHTMLページなど） しか取得できておらず、圧縮ファイル（gzip）として正しくダウンロードできていないため gzip: stdin: not in gzip format というエラーが出て解凍に失敗しています。
+Termuxで一番手軽かつ確実にインストールできる手順（pkg パッケージマネージャーを使う方法）でやり直しましょう！
+🚀 最も確実な解決手順
+以下のコマンドを1行ずつコピーして実行してください。
+1. ゴミファイルを一旦すべて消去
 rm -f ngrok*
 
-2. 最新のngrok（Linux ARM64用）をダウンロード
-curl -O https://bin.equinox.io/c/b4p2Bvh28hO/ngrok-v3-stable-linux-arm64.tgz
+2. Termuxのパッケージ（tur）を追加
+Termuxの有志コミュニティ（TUR）が配信しているngrokパッケージを利用します。
+pkg install tur-repo -y
 
-(※もし curl: command not found と出たら pkg install curl を先に実行してください)
-3. 圧縮ファイルを解凍
-tar -xvzf ngrok-v3-stable-linux-arm64.tgz
+3. ngrok を一発インストール！
+pkg install ngrok -y
 
-4. 実行権限の付与とPATHの移動（次回から ./ なしで使えます）
-mv ngrok $PREFIX/bin/
-
-動作確認
-上記が終わったら、以下のコマンドで動作を確認してみてください：
+💡 動作確認
+インストールが完了したら、以下のコマンドを実行してみてください。
 ngrok --version
 
-バージョン（ngrok version 3.x.x）が正常に表示されれば準備完了です！
-その後、本来実行したかった ngrok http 5000 を試してみてください。
+これで ngrok version 3.x.x のように表示されれば、手動でダウンロード・解凍する必要もなく完了です！
+そのまま ngrok http 5000 を試してみてください。
