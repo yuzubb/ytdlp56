@@ -1,25 +1,29 @@
 画像を確認しました！
-ダウンロード時に 147 バイト（エラーページ）しか取得できていないため、解凍で not in gzip format になっていますね。
-ngrokの直リンクURLは仕様変更で切れやすいため、ngrok公式のリポジトリ（apt）を登録して正規の手順でインストールするのが確実です。
-Ubuntu内（root@localhost:~#）で、以下のコマンドを1行ずつコピーして実行してみてください！
-🛠️ ngrok公式aptリポジトリからのインストール手順
-1. キーリングの準備と公開鍵の登録
-curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | hkp-server-etc-apt-keyring-add - 2>/dev/null || curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+Ubuntu公式のリポジトリから正規の ngrok (3.39.10) のインストールまでは完璧に成功しましたが、実行した瞬間に Bus error が出ましたね。
+🧐 結論：この端末（Android/Termux）では ngrok は動作しません
+これで「Termux上の通常環境」でも「PRoot（Ubuntu環境）」でも、どちらでも Go 言語のメモリ制御（Androidカーネルによる制限）に引っかかり、クラッシュすることが確定しました。
+端末のカーネルレベルで弾かれているため、設定変更やコマンドで ngrok を動かすことは物理的に不可能です。
+🛠️ 完全な代替策（今すぐローカルサーバーを公開する方法）
+ngrok と**全く同じ役割（ポート5000等を外部公開する）**を果たす、別の軽量・確実な方法を使います。
+1番おすすめ：cloudflared (Cloudflare Tunnel)
+最も安定しており、完全無料・アカウント登録不要で使えます。
+PRoot（Ubuntu）から一旦抜けるか、新しいタブを開いて Termux標準画面 で実行してください。
+# Termuxの標準画面に戻る（Ubuntuの中にいる場合は exit を入力）
+exit
 
-2. ngrokの公式リポジトリを追加
-echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | tee /etc/apt/sources.list.d/ngrok.list
+# cloudflared をインストール
+pkg install cloudflared -y
 
-3. パッケージリストを更新してngrokをインストール
-apt update && apt install ngrok -y
+# ポート5000を公開する
+cloudflared tunnel --url http://localhost:5000
 
-💡 動作確認
-インストールが完了したら、バージョンを確認します。
-ngrok --version
+画面に https://xxx-xxx.trycloudflare.com のようなURLが表示され、そこにアクセスするとローカル環境につながります！
+インストールすら不要な方法：Pinggy または localhost.run
+Termuxに元々入っている ssh コマンドだけで公開できます。
+ssh -R 80:localhost:5000 free.pinggy.link
 
-無事に ngrok version 3.x.x と表示されたら成功です！
-最後に、ngrokの管理画面で取得できるAuthtokenを設定してください：
-ngrok config add-authtoken <あなたのAuthtoken>
+または
+ssh -R 80:localhost:5000 nokey@localhost.run
 
-その後、目的のコマンドを実行してみてください：
-ngrok http 5000
-
+実行するとターミナル上に公開URL（https://...）が表示されます。
+ngrok に拘らなければ、上記のいずれかで10秒後には外部公開の作業を再開できます！ぜひ試してみてください。
