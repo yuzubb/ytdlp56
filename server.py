@@ -300,7 +300,7 @@ _API_DOCS_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>API一覧</title>
+<title>ytdlp_api - API一覧</title>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -382,7 +382,7 @@ const ENDPOINTS = [
       { name: "video_id", in: "path", placeholder: "dQw4w9WgXcQ" },
       { name: "limit", in: "query", placeholder: "50" },
     ] },
-  { method: "GET", path: "/api/related/{video_id}", desc: "関連動画(近似)。タイトル類似検索による代替であり、YouTube本家の関連動画とは異なる点に注意。",
+  { method: "GET", path: "/api/related/{video_id}", desc: "関連動画。watch pageのytInitialDataを構造非依存で探索して取得(YouTube側の多少の変更には自動追従)。",
     params: [
       { name: "video_id", in: "path", placeholder: "dQw4w9WgXcQ" },
       { name: "limit", in: "query", placeholder: "10" },
@@ -561,7 +561,7 @@ _STATS_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ytdlp</title>
+<title>ytdlp_api - stats</title>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -876,41 +876,229 @@ def comments(video_id):
     return jsonify(result)
 
 
+def _find_balanced_json(text, start_idx):
+    # start_idxの '{' から対応する '}' までを文字列として切り出すだけの地味な関数。
+    # 中に文字列リテラルが混ざってるとナイーブな正規表現だと簡単に壊れるので、
+    # ちゃんと文字列/エスケープを見ながら深さを数える。
+    depth = 0
+    in_string = False
+    escape = False
+    i = start_idx
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start_idx:i + 1]
+        i += 1
+    return None
+
+
+def _extract_yt_initial_data(html):
+    # 動画ページのソースには <script>var ytInitialData = {...};</script> みたいな形で
+    # ページの中身が丸ごとJSONで埋まってる。そこを引っこ抜くだけ。
+    # マーカーを何パターンか用意してるのは、YouTubeが時々書き方を変えてくるため
+    # (var付き/なし、ブラケット記法、など)。
+    for marker in ("var ytInitialData = ", 'ytInitialData"] = ', "ytInitialData = "):
+        idx = html.find(marker)
+        if idx == -1:
+            continue
+        brace_idx = html.find("{", idx)
+        if brace_idx == -1:
+            continue
+        json_str = _find_balanced_json(html, brace_idx)
+        if not json_str:
+            continue
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _runs_text(node):
+    # YouTubeの内部JSONはテキストが {"simpleText": "..."} だったり
+    # {"runs": [{"text": "a"}, {"text": "b"}]} だったりバラバラなので吸収する。
+    if not node:
+        return None
+    if "simpleText" in node:
+        return node["simpleText"]
+    runs = node.get("runs") or []
+    text = "".join(r.get("text", "") for r in runs)
+    return text or None
+
+
+def _dig(obj, *path):
+    # ネストしたdict/listを obj["a"]["b"][0]["c"] みたいに辿るやつ。
+    # 途中でキーが無くても例外で落ちずにNoneを返すだけの雑なヘルパー。
+    cur = obj
+    for key in path:
+        try:
+            cur = cur[key]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return cur
+
+
+def _walk(node):
+    # JSONツリー全体を舐めて、出てきたdictを片っ端からyieldする。
+    # 「compactVideoRendererはこの階層のこのキーの下」みたいな決め打ちを
+    # やめて全部潜るようにしておくと、YouTubeが階層をちょっといじった程度では
+    # 壊れなくなる。多少非効率だが動画1本分のJSONくらいなら誤差。
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            yield from _walk(v)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk(item)
+
+
+# 動画レンダラーからチャンネルIDを拾うための候補パス。
+# レンダラーの種類(compactVideoRenderer / videoRenderer / gridVideoRenderer 等)によって
+# 微妙に構造が違うので、上から順に試して最初に見つかったものを使う。
+_CHANNEL_ID_PATHS = (
+    ("channelThumbnailSupportedRenderers", "channelThumbnailWithLinkRenderer",
+     "navigationEndpoint", "browseEndpoint", "browseId"),
+    ("shortBylineText", "runs", 0, "navigationEndpoint", "browseEndpoint", "browseId"),
+    ("longBylineText", "runs", 0, "navigationEndpoint", "browseEndpoint", "browseId"),
+)
+
+
+def _looks_like_video(node):
+    # 「これは動画1本を表すレンダラーっぽいか」の判定。
+    # レンダラー名(compactVideoRendererとか)には依存せず、中身の形だけで判断する。
+    # videoIdとtitleは必須、あとthumbnail/lengthText/viewCount系のどれか1つでもあれば
+    # だいたい本物の動画カード。これで検索候補やチャットのメンションなど
+    # videoIdだけ持ってる別種のノイズを弾ける。
+    if not isinstance(node, dict):
+        return False
+    if not node.get("videoId") or not node.get("title"):
+        return False
+    return bool(
+        node.get("thumbnail")
+        or node.get("lengthText")
+        or node.get("shortViewCountText")
+        or node.get("viewCountText")
+    )
+
+
+def _parse_related(yt_data, own_video_id, limit):
+    """
+    ytInitialDataの中から動画カードっぽいノードを片っ端から拾って関連動画リストにする。
+    決め打ちのJSONパスに頼らないので、YouTube側がsecondaryResultsの階層構造を
+    変えてきても(レンダラー自体の形が大きく変わらない限り)そのまま動く。
+    """
+    seen = set()
+    entries = []
+
+    for node in _walk(yt_data):
+        if not _looks_like_video(node):
+            continue
+
+        video_id = node["videoId"]
+        if video_id == own_video_id or video_id in seen:
+            continue
+        seen.add(video_id)
+
+        channel_id = None
+        for path in _CHANNEL_ID_PATHS:
+            channel_id = _dig(node, *path)
+            if channel_id:
+                break
+
+        thumbnails = _dig(node, "thumbnail", "thumbnails") or []
+
+        entries.append({
+            "video_id": video_id,
+            "title": _runs_text(node.get("title")),
+            "channel": _runs_text(node.get("longBylineText") or node.get("shortBylineText")),
+            "channel_id": channel_id,
+            "length_text": _dig(node, "lengthText", "simpleText"),
+            "view_count_text": _dig(node, "shortViewCountText", "simpleText") or _runs_text(node.get("viewCountText")),
+            "thumbnail": thumbnails[-1]["url"] if thumbnails else None,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+        })
+
+        if len(entries) >= limit:
+            break
+
+    return entries
+
+
+# watch pageを叩くだけなのに毎回新規コネクション張るのは無駄なので使い回す。
+# ついでにブラウザっぽいヘッダを一式乗せておく(素のrequestsのUAだと弾かれることがある)。
+_http = requests.Session()
+_http.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+})
+
+
 @app.get("/api/related/<video_id>")
 def related(video_id):
     """
-    関連動画。
-    注意: yt-dlpはYouTube公式の「関連動画」レコメンドAPIを正式サポートしていない
-    (YouTube側の非公開API依存で壊れやすいため)。そのためここでは動画タイトルを
-    使った類似検索で近似している。本家の関連動画とは選定基準が異なる点に注意。
+    関連動画。yt-dlp自体には関連動画を取ってくる機能が無いので、watch pageのHTMLに
+    埋め込まれているytInitialDataを自前で解析している。
+    パースは決め打ちのJSONパスではなく「動画カードっぽい形のノードを全部拾う」方式にしてあるので、
+    YouTubeがページ構造を多少いじってきても大体は追従できるはず(レンダラーの形自体が
+    大きく変わったら流石にダメだが、その時はまたどこかで直す)。
     """
-    limit = max(1, min(int(request.args.get("limit", 10)), 25))
+    limit = max(1, min(int(request.args.get("limit", 10)), 50))
 
+    key = f"related:{video_id}:{limit}"
+    cached = _response_cache_get(key)
+    if cached is not None:
+        return jsonify(cached)
+
+    watch_url = _resolve_url(video_id)
     with _track_processing(video_id, "related"):
-        data = _extract_full(video_id)
+        try:
+            resp = _http.get(watch_url, timeout=15)
+        except requests.RequestException as e:
+            raise ApiError(502, f"failed to fetch watch page: {e}")
+        if resp.status_code >= 400:
+            raise ApiError(502, f"watch page returned HTTP {resp.status_code}")
+        yt_data = _extract_yt_initial_data(resp.text)
 
-    title = data.get("title") or ""
-    own_id = data.get("id")
+    if yt_data is None:
+        raise ApiError(
+            502,
+            "failed to parse ytInitialData from the watch page "
+            "(YouTube may have changed its page structure, or this isn't a YouTube video)",
+        )
 
-    with _track_processing(f"related-search:{video_id}", "related-search"):
-        search_info = _extract_flat(f"ytsearch{limit + 1}:{title}")
+    entries = _parse_related(yt_data, video_id, limit)
 
-    entries = [
-        _slim_entry(e) for e in (search_info.get("entries") or [])
-        if e.get("id") != own_id
-    ][:limit]
-
-    return jsonify(_json_safe({
+    result = _json_safe({
         "video_id": video_id,
-        "based_on_title": title,
-        "method": "approximate_title_search",
-        "note": (
-            "yt-dlpはYouTube公式の関連動画レコメンドを取得できないため、"
-            "動画タイトルによる類似検索で近似候補を返しています。"
-            "本家の「関連動画」とは選定基準が異なります。"
-        ),
+        "method": "youtube_watch_page_scrape",
+        "note": "watch pageのytInitialDataから抽出した関連動画。非公式な取得方法。",
+        "entry_count": len(entries),
         "entries": entries,
-    }))
+        "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
+    })
+    _response_cache_set(key, "related", video_id, result)
+
+    result = dict(result)
+    result["_cache"] = {"hit": False, "age_seconds": 0, "expires_in_seconds": RESPONSE_CACHE_TTL_SECONDS}
+    return jsonify(result)
 
 
 # ---------- info (ストリームURLは含まない全メタデータ) ----------
