@@ -2,29 +2,20 @@ import os
 import re
 import json
 import time
-import shutil
 import sqlite3
 import threading
-import subprocess
 import urllib.parse
 import contextlib
 from datetime import datetime
 
 import requests
 import yt_dlp
-from flask import Flask, request, jsonify, Response, send_file
+from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 
 TMP_DIR_PATH = os.environ.get("YTDLP_API_TMP", os.path.join(os.path.expanduser("~"), "ytdlp_api_tmp"))
 os.makedirs(TMP_DIR_PATH, exist_ok=True)
-
-HLS_JOBS = {}  # job_id -> subprocess.Popen
-JOB_TTL_SEC = int(os.environ.get("YTDLP_API_JOB_TTL", "1800"))  # 30分操作が無ければ自動失効
-
-# hls変換用に選んだ直リンクの短期キャッシュ (video_id, format_id) -> (url, expire_at, data)
-_HLS_URL_CACHE = {}
-HLS_URL_CACHE_TTL_SEC = int(os.environ.get("YTDLP_API_URLCACHE_TTL", "300"))  # 5分
 
 # /api/info, /api/stream の結果を保存する期間
 RESPONSE_CACHE_TTL_SECONDS = int(os.environ.get("YTDLP_API_CACHE_TTL_SECONDS", str(7 * 3600)))  # 7時間
@@ -43,7 +34,7 @@ _ACTIVE_JOBS_LOCK = threading.Lock()
 
 @contextlib.contextmanager
 def _track_processing(video_id, job_type):
-    """info取得・stream解決・hls変換開始などの間、処理中一覧に載せておく。"""
+    """info取得・stream解決などの間、処理中一覧に載せておく。"""
     with _ACTIVE_JOBS_LOCK:
         _ACTIVE_JOBS[video_id] = {
             "worker": SERVER_NAME,
@@ -186,6 +177,29 @@ def _resolve_url(video_id):
     return f"https://www.youtube.com/watch?v={decoded}"
 
 
+def _resolve_playlist_url(playlist_id):
+    """playlist_idがURLならデコードしてそのまま使い、そうでなければYouTubeのプレイリストとみなす。"""
+    decoded = urllib.parse.unquote(playlist_id)
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", decoded):
+        return decoded
+    return f"https://www.youtube.com/playlist?list={decoded}"
+
+
+def _resolve_channel_url(channel_id):
+    """
+    channel_idがURLならデコードしてそのまま使う。
+    '@handle' 形式、'UCxxxx' 形式のチャンネルID、素のハンドル名のどれでも受け付ける。
+    """
+    decoded = urllib.parse.unquote(channel_id)
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", decoded):
+        return decoded
+    if decoded.startswith("@"):
+        return f"https://www.youtube.com/{decoded}/videos"
+    if decoded.startswith("UC") and len(decoded) > 10:
+        return f"https://www.youtube.com/channel/{decoded}/videos"
+    return f"https://www.youtube.com/@{decoded}/videos"
+
+
 def _sanitize_id(video_id):
     return re.sub(r"[^a-zA-Z0-9_-]", "_", video_id)[:64]
 
@@ -231,32 +245,52 @@ def _extract_full(video_id):
     return data
 
 
-def _resolve_direct_url(video_id, format_id, use_cache=True):
-    """hls変換(ffmpeg入力)用に、単一フォーマットのCDN直リンクを取得する。"""
-    cache_key = (video_id, format_id)
-    if use_cache and cache_key in _HLS_URL_CACHE:
-        cached_url, expire_at, data = _HLS_URL_CACHE[cache_key]
-        if time.time() < expire_at:
-            return cached_url, data
+def _extract_flat(url, playliststart=None, playlistend=None):
+    """
+    検索結果・プレイリスト・チャンネルの一覧取得用。動画1本ずつをフル解析しないので高速。
+    (各動画の詳細が必要な場合は、返ってきたvideo_idで/api/info/{video_id}を叩く)
+    """
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "nocheckcertificate": True,
+        "extract_flat": "in_playlist",
+    }
+    if playliststart is not None:
+        opts["playliststart"] = playliststart
+    if playlistend is not None:
+        opts["playlistend"] = playlistend
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        raise ApiError(400, f"yt-dlp error: {e}")
 
-    source_url = _resolve_url(video_id)
-    data = _extract(source_url, {"format": format_id})
-    _cache_upsert(video_id, data)
-    stream_url = data.get("url")
-    if not stream_url and data.get("requested_formats"):
-        stream_url = data["requested_formats"][0].get("url")
-    if not stream_url:
-        raise ApiError(404, "direct url not found for this format")
 
-    _HLS_URL_CACHE[cache_key] = (stream_url, time.time() + HLS_URL_CACHE_TTL_SEC, data)
-    return stream_url, data
+def _slim_entry(e):
+    """検索結果/プレイリスト/チャンネル一覧の1件分を整形する共通ヘルパー。"""
+    thumbnails = e.get("thumbnails") or []
+    thumbnail = thumbnails[-1].get("url") if thumbnails else e.get("thumbnail")
+    return {
+        "video_id": e.get("id"),
+        "title": e.get("title"),
+        "url": e.get("url") or e.get("webpage_url"),
+        "duration": e.get("duration"),
+        "view_count": e.get("view_count"),
+        "channel": e.get("channel") or e.get("uploader"),
+        "channel_id": e.get("channel_id") or e.get("uploader_id"),
+        "thumbnail": thumbnail,
+        "live_status": e.get("live_status"),
+        "upload_date": e.get("upload_date"),
+    }
+
 
 
 # ---------- health ----------
 
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok", "jobs": len(HLS_JOBS), "uptime_seconds": _uptime_seconds()})
+    return jsonify({"status": "ok", "uptime_seconds": _uptime_seconds()})
 
 
 # ---------- /api (一覧・説明・実行テストページ) ----------
@@ -266,7 +300,7 @@ _API_DOCS_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ytdlp_api - API一覧</title>
+<title>API一覧</title>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -326,16 +360,36 @@ _API_DOCS_HTML = """<!doctype html>
 <script>
 const ENDPOINTS = [
   { method: "GET", path: "/api/health", desc: "死活監視", params: [] },
-  { method: "GET", path: "/api/info/{video_id}", desc: "動画の全メタデータを取得(ストリームURLは含まない)。7時間キャッシュ。",
-    params: [{ name: "video_id", in: "path", placeholder: "dQw4w9WgXcQ" }] },
-  { method: "GET", path: "/api/stream/{video_id}", desc: "その動画の全ストリームURL一覧 + HLS(m3u8)リンクを取得。7時間キャッシュ。",
-    params: [{ name: "video_id", in: "path", placeholder: "dQw4w9WgXcQ" }] },
-  { method: "GET", path: "/api/hls/{video_id}", desc: "リアルタイムHLS変換の再生リスト(m3u8)を返す。未変換なら自動で開始。",
+  { method: "GET", path: "/api/search", desc: "YouTube検索(flat抽出で高速)。",
+    params: [
+      { name: "q", in: "query", placeholder: "アイドルマスター" },
+      { name: "limit", in: "query", placeholder: "20" },
+    ] },
+  { method: "GET", path: "/api/playlist/{playlist_id}", desc: "プレイリストのメタ情報+収録動画一覧。",
+    params: [
+      { name: "playlist_id", in: "path", placeholder: "PLxxxxxxxxxxxxxxxx" },
+      { name: "limit", in: "query", placeholder: "100" },
+      { name: "offset", in: "query", placeholder: "0" },
+    ] },
+  { method: "GET", path: "/api/channel/{channel_id}", desc: "チャンネルのメタ情報+投稿動画一覧。@handle/UCxxxx/フルURLいずれも可。",
+    params: [
+      { name: "channel_id", in: "path", placeholder: "@handle" },
+      { name: "limit", in: "query", placeholder: "50" },
+      { name: "offset", in: "query", placeholder: "0" },
+    ] },
+  { method: "GET", path: "/api/comments/{video_id}", desc: "動画のコメント一覧を取得。件数が多いと時間がかかる。",
     params: [
       { name: "video_id", in: "path", placeholder: "dQw4w9WgXcQ" },
-      { name: "format_id", in: "query", placeholder: "best" },
+      { name: "limit", in: "query", placeholder: "50" },
     ] },
-  { method: "POST", path: "/api/hls/{video_id}/stop", desc: "HLS変換ジョブを停止し、一時ファイルを削除する。",
+  { method: "GET", path: "/api/related/{video_id}", desc: "関連動画(近似)。タイトル類似検索による代替であり、YouTube本家の関連動画とは異なる点に注意。",
+    params: [
+      { name: "video_id", in: "path", placeholder: "dQw4w9WgXcQ" },
+      { name: "limit", in: "query", placeholder: "10" },
+    ] },
+  { method: "GET", path: "/api/info/{video_id}", desc: "動画の全メタデータを取得(ストリームURLは含まない)。7時間キャッシュ。",
+    params: [{ name: "video_id", in: "path", placeholder: "dQw4w9WgXcQ" }] },
+  { method: "GET", path: "/api/stream/{video_id}", desc: "その動画の全ストリームURL一覧を取得。HLS(m3u8)直リンクがあればhls_urlに入る。7時間キャッシュ。",
     params: [{ name: "video_id", in: "path", placeholder: "dQw4w9WgXcQ" }] },
   { method: "GET", path: "/api/stats/data", desc: "worker一覧・処理中一覧・キャッシュ件数・稼働時間をJSONで取得。", params: [] },
   { method: "GET", path: "/api/workers", desc: "このサーバー(worker)の情報一覧。", params: [] },
@@ -507,7 +561,7 @@ _STATS_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ytdlp_api - stats</title>
+<title>ytdlp</title>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -672,6 +726,193 @@ def cache_delete(video_id):
     return jsonify({"deleted": video_id})
 
 
+# ---------- search / playlist / channel / comments / related ----------
+
+@app.get("/api/search")
+def search():
+    """?q=検索語 でYouTube検索。一覧は高速化のためflat抽出(詳細は/api/info/{video_id}を別途叩く)。"""
+    q = request.args.get("q")
+    if not q:
+        raise ApiError(400, "query parameter 'q' is required")
+    limit = max(1, min(int(request.args.get("limit", 20)), 50))
+
+    key = f"search:{q}:{limit}"
+    cached = _response_cache_get(key)
+    if cached is not None:
+        return jsonify(cached)
+
+    with _track_processing(f"search:{q}", "search"):
+        info = _extract_flat(f"ytsearch{limit}:{q}")
+
+    entries = [_slim_entry(e) for e in (info.get("entries") or [])]
+    result = _json_safe({
+        "query": q,
+        "result_count": len(entries),
+        "entries": entries,
+        "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
+    })
+    _response_cache_set(key, "search", q, result)
+
+    result = dict(result)
+    result["_cache"] = {"hit": False, "age_seconds": 0, "expires_in_seconds": RESPONSE_CACHE_TTL_SECONDS}
+    return jsonify(result)
+
+
+@app.get("/api/playlist/<playlist_id>")
+def playlist(playlist_id):
+    """プレイリストのメタ情報+収録動画一覧(flat抽出)。?limit=&offset=で範囲指定。"""
+    limit = max(1, min(int(request.args.get("limit", 100)), 500))
+    offset = max(0, int(request.args.get("offset", 0)))
+
+    key = f"playlist:{playlist_id}:{limit}:{offset}"
+    cached = _response_cache_get(key)
+    if cached is not None:
+        return jsonify(cached)
+
+    url = _resolve_playlist_url(playlist_id)
+    with _track_processing(playlist_id, "playlist"):
+        info = _extract_flat(url, playliststart=offset + 1, playlistend=offset + limit)
+
+    entries = [_slim_entry(e) for e in (info.get("entries") or [])]
+    result = _json_safe({
+        "playlist_id": info.get("id") or playlist_id,
+        "title": info.get("title"),
+        "uploader": info.get("uploader") or info.get("channel"),
+        "channel_id": info.get("channel_id") or info.get("uploader_id"),
+        "webpage_url": info.get("webpage_url"),
+        "description": info.get("description"),
+        "entry_count_total": info.get("playlist_count"),
+        "entry_count_returned": len(entries),
+        "entries": entries,
+        "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
+    })
+    _response_cache_set(key, "playlist", playlist_id, result)
+
+    result = dict(result)
+    result["_cache"] = {"hit": False, "age_seconds": 0, "expires_in_seconds": RESPONSE_CACHE_TTL_SECONDS}
+    return jsonify(result)
+
+
+@app.get("/api/channel/<channel_id>")
+def channel(channel_id):
+    """
+    チャンネルのメタ情報+投稿動画一覧(flat抽出)。?limit=&offset=で範囲指定。
+    channel_id は '@handle'、'UCxxxx'、素のハンドル名、フルURLのいずれでも指定可能。
+    """
+    limit = max(1, min(int(request.args.get("limit", 50)), 500))
+    offset = max(0, int(request.args.get("offset", 0)))
+
+    key = f"channel:{channel_id}:{limit}:{offset}"
+    cached = _response_cache_get(key)
+    if cached is not None:
+        return jsonify(cached)
+
+    url = _resolve_channel_url(channel_id)
+    with _track_processing(channel_id, "channel"):
+        info = _extract_flat(url, playliststart=offset + 1, playlistend=offset + limit)
+
+    entries = [_slim_entry(e) for e in (info.get("entries") or [])]
+    result = _json_safe({
+        "channel_id": info.get("channel_id") or info.get("id") or channel_id,
+        "channel": info.get("channel") or info.get("uploader") or info.get("title"),
+        "channel_follower_count": info.get("channel_follower_count"),
+        "description": info.get("description"),
+        "webpage_url": info.get("webpage_url"),
+        "entry_count_total": info.get("playlist_count"),
+        "entry_count_returned": len(entries),
+        "entries": entries,
+        "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
+    })
+    _response_cache_set(key, "channel", channel_id, result)
+
+    result = dict(result)
+    result["_cache"] = {"hit": False, "age_seconds": 0, "expires_in_seconds": RESPONSE_CACHE_TTL_SECONDS}
+    return jsonify(result)
+
+
+@app.get("/api/comments/<video_id>")
+def comments(video_id):
+    """動画のコメント一覧を取得する(yt-dlpのgetcomments機能)。件数が多いと時間がかかる。"""
+    limit = str(max(1, min(int(request.args.get("limit", 50)), 500)))
+
+    key = f"comments:{video_id}:{limit}"
+    cached = _response_cache_get(key)
+    if cached is not None:
+        return jsonify(cached)
+
+    source_url = _resolve_url(video_id)
+    with _track_processing(video_id, "comments"):
+        data = _extract(source_url, {
+            "getcomments": True,
+            "extractor_args": {"youtube": {"max_comments": [limit, "all", limit, "10"]}},
+        })
+
+    raw_comments = data.get("comments") or []
+    slim_comments = [{
+        "id": c.get("id"),
+        "text": c.get("text"),
+        "author": c.get("author"),
+        "author_id": c.get("author_id"),
+        "author_is_uploader": c.get("author_is_uploader"),
+        "like_count": c.get("like_count"),
+        "is_pinned": c.get("is_pinned"),
+        "is_favorited": c.get("is_favorited"),
+        "parent": c.get("parent"),
+        "timestamp": c.get("timestamp"),
+        "time_text": c.get("time_text"),
+    } for c in raw_comments]
+
+    result = _json_safe({
+        "video_id": video_id,
+        "comment_count_returned": len(slim_comments),
+        "comment_count_total": data.get("comment_count"),
+        "comments": slim_comments,
+        "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
+    })
+    _response_cache_set(key, "comments", video_id, result)
+
+    result = dict(result)
+    result["_cache"] = {"hit": False, "age_seconds": 0, "expires_in_seconds": RESPONSE_CACHE_TTL_SECONDS}
+    return jsonify(result)
+
+
+@app.get("/api/related/<video_id>")
+def related(video_id):
+    """
+    関連動画。
+    注意: yt-dlpはYouTube公式の「関連動画」レコメンドAPIを正式サポートしていない
+    (YouTube側の非公開API依存で壊れやすいため)。そのためここでは動画タイトルを
+    使った類似検索で近似している。本家の関連動画とは選定基準が異なる点に注意。
+    """
+    limit = max(1, min(int(request.args.get("limit", 10)), 25))
+
+    with _track_processing(video_id, "related"):
+        data = _extract_full(video_id)
+
+    title = data.get("title") or ""
+    own_id = data.get("id")
+
+    with _track_processing(f"related-search:{video_id}", "related-search"):
+        search_info = _extract_flat(f"ytsearch{limit + 1}:{title}")
+
+    entries = [
+        _slim_entry(e) for e in (search_info.get("entries") or [])
+        if e.get("id") != own_id
+    ][:limit]
+
+    return jsonify(_json_safe({
+        "video_id": video_id,
+        "based_on_title": title,
+        "method": "approximate_title_search",
+        "note": (
+            "yt-dlpはYouTube公式の関連動画レコメンドを取得できないため、"
+            "動画タイトルによる類似検索で近似候補を返しています。"
+            "本家の「関連動画」とは選定基準が異なります。"
+        ),
+        "entries": entries,
+    }))
+
+
 # ---------- info (ストリームURLは含まない全メタデータ) ----------
 
 # レスポンスから除外するキー(ストリームURLや巨大すぎる/内部利用のフィールド)
@@ -739,7 +980,7 @@ def info(video_id):
     return jsonify(result)
 
 
-# ---------- stream (全ストリームURL一覧 + HLSリンク) ----------
+# ---------- stream (全ストリームURL一覧。あればHLS直リンクも) ----------
 
 _STREAM_FIELDS = [
     "format_id", "format_note", "ext", "resolution", "width", "height", "fps",
@@ -769,7 +1010,6 @@ def _build_stream_payload(video_id, data):
         "is_live": data.get("is_live", False),
         "streams": streams,
         "hls_url": hls_url,  # yt-dlpが返す実際のHLS(m3u8)直リンク。無い場合はnull
-        "local_hls_endpoint": f"/api/hls/{video_id}",  # 自前のリアルタイム変換(VODでも常に使える)
         "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
     })
 
@@ -794,110 +1034,6 @@ def stream(video_id):
         "expires_in_seconds": RESPONSE_CACHE_TTL_SECONDS,
     }
     return jsonify(result)
-
-
-# ---------- hls (リアルタイム変換) ----------
-
-def _cleanup_stale_jobs():
-    now = time.time()
-    for job_id, proc in list(HLS_JOBS.items()):
-        job_dir = os.path.join(TMP_DIR_PATH, job_id)
-        marker = os.path.join(job_dir, ".started")
-        if os.path.exists(marker) and now - os.path.getmtime(marker) > JOB_TTL_SEC:
-            proc.terminate()
-            HLS_JOBS.pop(job_id, None)
-            shutil.rmtree(job_dir, ignore_errors=True)
-
-
-def _watch_hls_job(video_id, proc):
-    """ffmpegの終了を待って処理中一覧から外すバックグラウンドスレッド。"""
-    proc.wait()
-    with _ACTIVE_JOBS_LOCK:
-        _ACTIVE_JOBS.pop(video_id, None)
-
-
-def _start_hls_job(video_id, format_id):
-    job_id = _sanitize_id(video_id)
-
-    existing = HLS_JOBS.get(job_id)
-    if existing and existing.poll() is None:
-        open(os.path.join(TMP_DIR_PATH, job_id, ".started"), "a").close()  # TTLを延長
-        return job_id
-
-    with _track_processing(video_id, "hls-resolve"):
-        stream_url, _ = _resolve_direct_url(video_id, format_id, use_cache=False)
-
-    job_dir = os.path.join(TMP_DIR_PATH, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-    open(os.path.join(job_dir, ".started"), "a").close()
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", stream_url,
-        "-c:v", "libx264", "-preset", "veryfast",
-        "-c:a", "aac",
-        "-f", "hls",
-        "-hls_time", "4",
-        "-hls_list_size", "0",
-        "-hls_segment_filename", os.path.join(job_dir, "seg_%03d.ts"),
-        os.path.join(job_dir, "index.m3u8"),
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    HLS_JOBS[job_id] = proc
-
-    with _ACTIVE_JOBS_LOCK:
-        _ACTIVE_JOBS[video_id] = {
-            "worker": SERVER_NAME,
-            "type": "hls-transcode",
-            "started_at": time.time(),
-        }
-    threading.Thread(target=_watch_hls_job, args=(video_id, proc), daemon=True).start()
-
-    return job_id
-
-
-@app.get("/api/hls/<video_id>")
-def hls_playlist(video_id):
-    format_id = request.args.get("format_id", "best")
-    _cleanup_stale_jobs()
-    job_id = _start_hls_job(video_id, format_id)
-
-    playlist_path = os.path.join(TMP_DIR_PATH, job_id, "index.m3u8")
-    for _ in range(50):  # 最大5秒待機
-        if os.path.exists(playlist_path):
-            break
-        time.sleep(0.1)
-
-    if not os.path.exists(playlist_path):
-        raise ApiError(503, "transcoding not ready yet, retry shortly")
-
-    return send_file(playlist_path, mimetype="application/vnd.apple.mpegurl")
-
-
-@app.get("/api/hls/<video_id>/<filename>")
-def hls_file(video_id, filename):
-    if "/" in filename or ".." in filename:
-        raise ApiError(400, "invalid filename")
-    job_id = _sanitize_id(video_id)
-    path = os.path.join(TMP_DIR_PATH, job_id, filename)
-    if not os.path.exists(path):
-        raise ApiError(404, "not found (still transcoding? wait a moment)")
-    media_type = "application/vnd.apple.mpegurl" if filename.endswith(".m3u8") else "video/mp2t"
-    return send_file(path, mimetype=media_type)
-
-
-@app.post("/api/hls/<video_id>/stop")
-def hls_stop(video_id):
-    job_id = _sanitize_id(video_id)
-    proc = HLS_JOBS.pop(job_id, None)
-    if proc:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-    shutil.rmtree(os.path.join(TMP_DIR_PATH, job_id), ignore_errors=True)
-    return jsonify({"stopped": job_id})
 
 
 if __name__ == "__main__":
