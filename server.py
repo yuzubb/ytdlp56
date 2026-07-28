@@ -65,6 +65,10 @@ os.makedirs(TMP_DIR_PATH, exist_ok=True)
 # /api/info, /api/stream の結果を保存する期間
 RESPONSE_CACHE_TTL_SECONDS = int(os.environ.get("YTDLP_API_CACHE_TTL_SECONDS", str(7 * 3600)))  # 7時間
 
+# /api/proxy-stream が使う、フォーマットごとのCDN直リンクの短時間キャッシュ
+_STREAM_URL_CACHE = {}
+STREAM_URL_CACHE_TTL_SEC = int(os.environ.get("YTDLP_API_STREAM_URLCACHE_TTL", "1800"))  # 30分
+
 # ---------- worker / 稼働状況 ----------
 
 SERVER_ID = os.environ.get("YTDLP_API_SERVER_ID", "1")
@@ -1020,6 +1024,84 @@ def comments(video_id):
     return jsonify(result)
 
 
+@app.get("/api/livechat/<video_id>")
+def livechat(video_id):
+    """
+    ライブ配信(または過去のライブ配信のアーカイブ)のチャットを取得する。
+
+    【試験的な実装であることに注意】
+    YouTubeのライブチャットは本来「継続トークン」を辿りながら少しずつ取得する
+    仕組みになっていて、配信全体のチャットを遡って全部取るには何度もリクエストを
+    繰り返す必要がある。この実装はそこまでは行っておらず、yt-dlpが最初に教えてくれる
+    チャットデータのURLに一度アクセスして、そこに含まれているメッセージだけを
+    パースして返す簡易版。ライブチャットが存在しない動画(通常のアップロード動画等)では
+    404になる。
+    """
+    limit = max(1, min(int(request.args.get("limit", 200)), 500))
+
+    key = f"livechat:{video_id}:{limit}"
+    cached = _response_cache_get(key)
+    if cached is not None:
+        return jsonify(cached)
+
+    source_url = _resolve_url(video_id)
+    with _track_processing(video_id, "livechat"):
+        data = _extract(source_url)
+        live_chat_formats = (data.get("subtitles") or {}).get("live_chat") or []
+        if not live_chat_formats:
+            raise ApiError(404, "this video has no live chat available (not a livestream, or chat replay is disabled)")
+
+        chat_url = live_chat_formats[0].get("url")
+        if not chat_url:
+            raise ApiError(404, "live chat url not found")
+
+        resp = _fetch_page(chat_url, timeout=15)
+        if resp.status_code >= 400:
+            raise ApiError(502, f"failed to fetch live chat data: HTTP {resp.status_code}")
+
+    # ライブチャットのレスポンスは1行1JSONのことが多いので、行ごとにパースを試す
+    messages = []
+    for line in resp.text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            chunk = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for node in _walk(chunk):
+            if not isinstance(node, dict) or "message" not in node:
+                continue
+            if "authorName" not in node and "authorExternalChannelId" not in node:
+                continue
+            text = _runs_text(node.get("message"))
+            if not text:
+                continue
+            messages.append({
+                "author": _runs_text(node.get("authorName")),
+                "text": text,
+                "timestamp_usec": node.get("timestampUsec"),
+            })
+            if len(messages) >= limit:
+                break
+        if len(messages) >= limit:
+            break
+
+    result = _json_safe({
+        "video_id": video_id,
+        "method": "experimental_live_chat_first_segment",
+        "note": "継続トークンを辿る本格実装ではなく、最初に取得できた範囲のチャットだけを返す試験的な機能です。",
+        "message_count": len(messages),
+        "messages": messages,
+        "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
+    })
+    _response_cache_set(key, "livechat", video_id, result)
+
+    result = dict(result)
+    result["_cache"] = {"hit": False, "age_seconds": 0, "expires_in_seconds": RESPONSE_CACHE_TTL_SECONDS}
+    return jsonify(result)
+
+
 def _find_balanced_json(text, start_idx):
     # start_idxの '{' から対応する '}' までを文字列として切り出すだけの地味な関数。
     # 中に文字列リテラルが混ざってるとナイーブな正規表現だと簡単に壊れるので、
@@ -1113,12 +1195,15 @@ def _walk(node):
 
 def _find_thumbnails_under(node):
     # dictの中のどこかにある "thumbnails": [...] を深さ問わず探して返す。
+    # YouTubeは新しいページ構造(pageHeaderViewModel系)だと同じ役割のキーが
+    # "sources" という名前になっていることがあるので、そちらも見る。
     # avatar/bannerのJSON構造はチャンネルによって微妙に階層が違うことがあるので、
     # ピンポイントでパスを決め打ちせずに総当たりする。
     if isinstance(node, dict):
-        thumbs = node.get("thumbnails")
-        if isinstance(thumbs, list) and thumbs:
-            return thumbs
+        for key in ("thumbnails", "sources"):
+            thumbs = node.get(key)
+            if isinstance(thumbs, list) and thumbs and isinstance(thumbs[0], dict) and thumbs[0].get("url"):
+                return thumbs
         for v in node.values():
             found = _find_thumbnails_under(v)
             if found:
@@ -1302,13 +1387,14 @@ def related(video_id):
 def trending():
     """
     おすすめ/トレンドフィード。ログイン無し・パーソナライズ無しの状態で
-    https://www.youtube.com/feed/trending が返すページのytInitialDataを解析している。
-    relatedと同じ「動画カードっぽいノードを片っ端から拾う」方式なので構造変更にもある程度強い。
+    https://www.youtube.com/feed/trending の動画一覧を返す。
+
+    まずyt-dlp自体の抽出機能(search/playlist/channelと同じ_extract_flat)を試す。
+    yt-dlpはBotガード回避やページ構造変更への追従が activelyメンテナンスされていて、
+    自前のytInitialDataスクレイピングより頑健なため。それでも失敗した場合のみ、
+    生スクレイピング(related等と同じ「動画カードを総当たりで拾う」方式)にフォールバックする。
     視聴履歴を反映した「あなたへのおすすめ」ではない点に注意(そもそもログインしていないので
     YouTube側もパーソナライズしたフィードを返してこない)。
-
-    /feed/trending が(地域やアクセス状況によって)空の結果しか返さない場合があるため、
-    その時はYouTubeのトップページを代わりに見に行くフォールバックを入れてある。
     """
     limit = max(1, min(int(request.args.get("limit", 24)), 50))
 
@@ -1317,34 +1403,50 @@ def trending():
     if cached is not None:
         return jsonify(cached)
 
-    def _fetch_entries(url):
-        try:
-            resp = _fetch_page(_add_lang_params(url), timeout=15)
-        except ApiError as e:
-            return None, e.message
-        if resp.status_code >= 400:
-            return None, f"HTTP {resp.status_code}"
-        yt_data = _extract_yt_initial_data(resp.text)
-        if yt_data is None:
-            return None, "ytInitialData not found"
-        return _parse_video_cards(yt_data, None, limit), None
+    entries = None
+    last_error = None
+    method = None
 
     with _track_processing("trending", "trending"):
-        entries, last_error = _fetch_entries("https://www.youtube.com/feed/trending")
+        # 1. yt-dlp自体の抽出を試す(一番頑健)
+        try:
+            info = _extract_flat("https://www.youtube.com/feed/trending", playlistend=limit)
+            flat_entries = [_slim_entry(e) for e in (info.get("entries") or [])]
+            if flat_entries:
+                entries = flat_entries
+                method = "yt_dlp_extract"
+        except ApiError as e:
+            last_error = e.message
 
+        # 2. ダメなら自前のytInitialDataスクレイピング(トレンドページ→トップページの順)
         if not entries:
-            # トレンドページが空/失敗ならトップページで代替を試みる
-            fallback_entries, fallback_error = _fetch_entries("https://www.youtube.com/")
-            if fallback_entries:
-                entries = fallback_entries
+            def _fetch_entries(url):
+                try:
+                    resp = _fetch_page(_add_lang_params(url), timeout=15)
+                except ApiError as e:
+                    return None, e.message
+                if resp.status_code >= 400:
+                    return None, f"HTTP {resp.status_code}"
+                yt_data = _extract_yt_initial_data(resp.text)
+                if yt_data is None:
+                    return None, "ytInitialData not found"
+                return _parse_video_cards(yt_data, None, limit), None
+
+            scraped_entries, scrape_error = _fetch_entries("https://www.youtube.com/feed/trending")
+            if not scraped_entries:
+                scraped_entries, fallback_error = _fetch_entries("https://www.youtube.com/")
+                scrape_error = scrape_error or fallback_error
+            if scraped_entries:
+                entries = scraped_entries
+                method = "youtube_page_scrape"
             elif last_error is None:
-                last_error = fallback_error
+                last_error = scrape_error
 
     if not entries:
         raise ApiError(502, f"failed to fetch trending feed: {last_error or 'no entries found'}")
 
     result = _json_safe({
-        "method": "youtube_trending_page_scrape",
+        "method": method,
         "note": "YouTubeのトレンドページ(非ログイン・非パーソナライズ)から取得した動画一覧。",
         "entry_count": len(entries),
         "entries": entries,
@@ -1469,8 +1571,85 @@ def _build_stream_payload(video_id, data):
         "is_live": data.get("is_live", False),
         "streams": streams,
         "hls_url": hls_url,  # yt-dlpが返す実際のHLS(m3u8)直リンク。無い場合はnull
+        # streams[].url はサーバーが解決した時のIPに紐付いていることがあり、
+        # ブラウザから直接叩くと再生できない場合がある。その時はこちらを使う。
+        # {format_id} を streams[].format_id に置き換えて叩けば、サーバー側で中継してくれる。
+        "proxy_url_template": f"/api/proxy-stream/{video_id}?format_id={{format_id}}",
         "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
     })
+
+
+def _resolve_direct_url(video_id, format_id, use_cache=True):
+    """
+    指定フォーマットのCDN直リンクを取得する。/api/proxy-stream 用に短時間キャッシュする
+    (毎回のRangeリクエストごとにyt-dlpを叩き直すと遅すぎるため)。
+    """
+    cache_key = (video_id, format_id)
+    if use_cache and cache_key in _STREAM_URL_CACHE:
+        cached_url, expire_at = _STREAM_URL_CACHE[cache_key]
+        if time.time() < expire_at:
+            return cached_url
+
+    source_url = _resolve_url(video_id)
+    data = _extract(source_url, {"format": format_id})
+    stream_url = data.get("url")
+    if not stream_url and data.get("requested_formats"):
+        stream_url = data["requested_formats"][0].get("url")
+    if not stream_url:
+        raise ApiError(404, "direct url not found for this format")
+
+    _STREAM_URL_CACHE[cache_key] = (stream_url, time.time() + STREAM_URL_CACHE_TTL_SEC)
+    return stream_url
+
+
+@app.get("/api/proxy-stream/<video_id>")
+def proxy_stream(video_id):
+    """
+    ブラウザから直接googlevideo等のCDN URLを叩くと、IPバインド(yt-dlpが解決したサーバーの
+    IPからしかアクセスできない)の影響で再生できないことがある。このエンドポイントは
+    サーバー側でストリームを取得してそのままクライアントへ中継することで、どの端末からでも
+    確実に再生できるようにする。Rangeリクエストにも対応しているのでシークもできる。
+    """
+    format_id = request.args.get("format_id", "18")
+    range_header = request.headers.get("Range")
+    fwd_headers = {"Range": range_header} if range_header else {}
+
+    def _try_fetch(use_cache):
+        url = _resolve_direct_url(video_id, format_id, use_cache=use_cache)
+        return requests.get(url, headers=fwd_headers, stream=True, timeout=30)
+
+    try:
+        upstream = _try_fetch(use_cache=True)
+        if upstream.status_code >= 400:
+            upstream.close()
+            raise requests.RequestException(f"upstream returned {upstream.status_code}")
+    except requests.RequestException:
+        # キャッシュしていたURLが失効している可能性があるので、1回だけ再解決してリトライ
+        try:
+            upstream = _try_fetch(use_cache=False)
+        except requests.RequestException as e:
+            raise ApiError(502, f"upstream fetch failed: {e}")
+        if upstream.status_code >= 400:
+            upstream.close()
+            raise ApiError(502, f"upstream returned {upstream.status_code}")
+
+    passthrough_headers = {}
+    for h in ("Content-Range", "Content-Length", "Accept-Ranges", "Content-Type"):
+        if h in upstream.headers:
+            passthrough_headers[h] = upstream.headers[h]
+    passthrough_headers.setdefault("Accept-Ranges", "bytes")
+    passthrough_headers.setdefault("Content-Type", "video/mp4")
+
+    def gen():
+        try:
+            for chunk in upstream.iter_content(65536):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    status_code = 206 if range_header and "Content-Range" in upstream.headers else upstream.status_code
+    return Response(gen(), status=status_code, headers=passthrough_headers)
 
 
 @app.get("/api/stream/<video_id>")
