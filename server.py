@@ -48,6 +48,8 @@ import base64
 import sqlite3
 import threading
 import urllib.parse
+import urllib.request
+import urllib.error
 import contextlib
 from datetime import datetime
 
@@ -261,6 +263,42 @@ def _add_lang_params(url):
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
 
 
+class _PageResponse:
+    """requestsのResponseっぽい最小限の入れ物(status_code/textだけ)。"""
+    def __init__(self, status_code, text):
+        self.status_code = status_code
+        self.text = text
+
+
+_PAGE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Cookie": "CONSENT=YES+1; SOCS=CAI",
+}
+
+
+def _fetch_page(url, timeout=15):
+    """
+    YouTubeの生HTMLページを取ってくる。requestsではなくPython標準ライブラリ(urllib)を
+    使っている。requests(urllib3)だとブロックされるケースでも、urllibだとTLS/HTTPの
+    フィンガープリントが変わって通ることがあるため、生スクレイピング系はこちらに統一した。
+    """
+    req = urllib.request.Request(url, headers=_PAGE_HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.getcode()
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        status = e.code
+        raw = e.read() if e.fp else b""
+    except urllib.error.URLError as e:
+        raise ApiError(502, f"failed to fetch page: {e.reason}")
+    return _PageResponse(status, raw.decode("utf-8", errors="replace"))
+
+
 def _ydl_opts(extra=None):
     opts = {
         "quiet": True,
@@ -273,7 +311,15 @@ def _ydl_opts(extra=None):
         "extractor_args": {"youtube": {"lang": ["ja"]}},
     }
     if extra:
+        extra = dict(extra)
+        # extractor_argsは単純にdict.updateすると丸ごと上書きされてlang指定が
+        # 消えてしまうので(例: コメント取得時のmax_comments指定)、ここだけ個別にマージする。
+        extra_extractor_args = extra.pop("extractor_args", None)
         opts.update(extra)
+        if extra_extractor_args:
+            merged_youtube_args = dict(opts["extractor_args"].get("youtube", {}))
+            merged_youtube_args.update(extra_extractor_args.get("youtube", {}))
+            opts["extractor_args"] = {"youtube": merged_youtube_args}
     return opts
 
 
@@ -886,13 +932,13 @@ def channel(channel_id):
         avatar_url = None
         banner_url = None
         try:
-            page_resp = _http.get(_add_lang_params(url), timeout=10)
+            page_resp = _fetch_page(_add_lang_params(url), timeout=10)
             if page_resp.status_code < 400:
                 yt_data = _extract_yt_initial_data(page_resp.text)
                 if yt_data:
                     avatar_url = _find_named_image_url(yt_data, "avatar")
                     banner_url = _find_named_image_url(yt_data, "banner")
-        except requests.RequestException:
+        except ApiError:
             pass
 
         if not avatar_url:
@@ -950,6 +996,7 @@ def comments(video_id):
         "text": c.get("text"),
         "author": c.get("author"),
         "author_id": c.get("author_id"),
+        "author_thumbnail": c.get("author_thumbnail"),
         "author_is_uploader": c.get("author_is_uploader"),
         "like_count": c.get("like_count"),
         "is_pinned": c.get("is_pinned"),
@@ -1222,10 +1269,7 @@ def related(video_id):
 
     watch_url = _resolve_url(video_id)
     with _track_processing(video_id, "related"):
-        try:
-            resp = _http.get(_add_lang_params(watch_url), timeout=15)
-        except requests.RequestException as e:
-            raise ApiError(502, f"failed to fetch watch page: {e}")
+        resp = _fetch_page(_add_lang_params(watch_url), timeout=15)
         if resp.status_code >= 400:
             raise ApiError(502, f"watch page returned HTTP {resp.status_code}")
         yt_data = _extract_yt_initial_data(resp.text)
@@ -1274,7 +1318,10 @@ def trending():
         return jsonify(cached)
 
     def _fetch_entries(url):
-        resp = _http.get(_add_lang_params(url), timeout=15)
+        try:
+            resp = _fetch_page(_add_lang_params(url), timeout=15)
+        except ApiError as e:
+            return None, e.message
         if resp.status_code >= 400:
             return None, f"HTTP {resp.status_code}"
         yt_data = _extract_yt_initial_data(resp.text)
@@ -1283,24 +1330,15 @@ def trending():
         return _parse_video_cards(yt_data, None, limit), None
 
     with _track_processing("trending", "trending"):
-        entries = None
-        last_error = None
-        try:
-            entries, last_error = _fetch_entries("https://www.youtube.com/feed/trending")
-        except requests.RequestException as e:
-            last_error = str(e)
+        entries, last_error = _fetch_entries("https://www.youtube.com/feed/trending")
 
         if not entries:
             # トレンドページが空/失敗ならトップページで代替を試みる
-            try:
-                fallback_entries, fallback_error = _fetch_entries("https://www.youtube.com/")
-                if fallback_entries:
-                    entries = fallback_entries
-                elif last_error is None:
-                    last_error = fallback_error
-            except requests.RequestException as e:
-                if last_error is None:
-                    last_error = str(e)
+            fallback_entries, fallback_error = _fetch_entries("https://www.youtube.com/")
+            if fallback_entries:
+                entries = fallback_entries
+            elif last_error is None:
+                last_error = fallback_error
 
     if not entries:
         raise ApiError(502, f"failed to fetch trending feed: {last_error or 'no entries found'}")
@@ -1374,7 +1412,22 @@ def info(video_id):
     with _track_processing(video_id, "info"):
         data = _extract_full(video_id)
 
+        # 投稿者のアバター画像。yt-dlpの info dict には入っていないので、
+        # watch pageのytInitialDataから channel/related と同じ要領で拾ってくる。
+        channel_avatar_url = None
+        want_base64 = request.args.get("base64", "1") != "0"
+        try:
+            page_resp = _fetch_page(_add_lang_params(_resolve_url(video_id)), timeout=10)
+            if page_resp.status_code < 400:
+                yt_data = _extract_yt_initial_data(page_resp.text)
+                if yt_data:
+                    channel_avatar_url = _find_named_image_url(yt_data, "avatar")
+        except ApiError:
+            pass
+
     result = _build_info_payload(data)
+    result["channel_avatar"] = channel_avatar_url
+    result["channel_avatar_base64"] = _image_to_data_uri(channel_avatar_url) if want_base64 else None
     _response_cache_set(key, "info", video_id, result)
 
     result = dict(result)
