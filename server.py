@@ -9,7 +9,7 @@ ffmpegも不要(HLSリアルタイム変換機能は廃止し、yt-dlpが把握�
   GET    /api                                  API一覧・説明・実行テスト用ページ(HTML)
   GET    /api/search                           YouTube検索(?q=検索語&limit=件数)
   GET    /api/playlist/{playlist_id}            プレイリストのメタ情報+収録動画一覧
-  GET    /api/channel/{channel_id}              チャンネルのメタ情報+投稿動画一覧
+  GET    /api/channel/{channel_id}              チャンネルのメタ情報+投稿動画一覧+アバター/バナー(base64)
   GET    /api/comments/{video_id}               動画のコメント一覧
   GET    /api/related/{video_id}                関連動画(watch pageのytInitialDataを解析。非公式)
   GET    /api/trending                          おすすめ/トレンドフィード(非ログイン・非パーソナライズ)
@@ -44,6 +44,7 @@ import os
 import re
 import json
 import time
+import base64
 import sqlite3
 import threading
 import urllib.parse
@@ -246,6 +247,20 @@ def _sanitize_id(video_id):
     return re.sub(r"[^a-zA-Z0-9_-]", "_", video_id)[:64]
 
 
+def _add_lang_params(url):
+    """
+    YouTubeの生ページ(watch page / trending / channel等)を直接requestsで叩く時用。
+    Accept-Languageヘッダだけだと日本語のタイトルなのに英語に自動翻訳されて
+    返ってくることがあるため、URLに hl=ja&gl=JP を明示的に付けて抑える。
+    """
+    parts = urllib.parse.urlsplit(url)
+    query = dict(urllib.parse.parse_qsl(parts.query))
+    query.setdefault("hl", "ja")
+    query.setdefault("gl", "JP")
+    new_query = urllib.parse.urlencode(query)
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+
 def _ydl_opts(extra=None):
     opts = {
         "quiet": True,
@@ -253,6 +268,9 @@ def _ydl_opts(extra=None):
         "noplaylist": True,
         "skip_download": True,
         "nocheckcertificate": True,
+        # YouTubeは視聴環境の言語設定によっては、オリジナルが日本語のタイトルでも
+        # 自動翻訳された英語タイトルを返してくることがある。明示的にjaを指定して抑える。
+        "extractor_args": {"youtube": {"lang": ["ja"]}},
     }
     if extra:
         opts.update(extra)
@@ -297,6 +315,7 @@ def _extract_flat(url, playliststart=None, playlistend=None):
         "no_warnings": True,
         "nocheckcertificate": True,
         "extract_flat": "in_playlist",
+        "extractor_args": {"youtube": {"lang": ["ja"]}},
     }
     if playliststart is not None:
         opts["playliststart"] = playliststart
@@ -413,7 +432,7 @@ const ENDPOINTS = [
       { name: "limit", in: "query", placeholder: "100" },
       { name: "offset", in: "query", placeholder: "0" },
     ] },
-  { method: "GET", path: "/api/channel/{channel_id}", desc: "チャンネルのメタ情報+投稿動画一覧。@handle/UCxxxx/フルURLいずれも可。",
+  { method: "GET", path: "/api/channel/{channel_id}", desc: "チャンネルのメタ情報+投稿動画一覧+アバター/バナー(base64)。@handle/UCxxxx/フルURLいずれも可。",
     params: [
       { name: "channel_id", in: "path", placeholder: "@handle" },
       { name: "limit", in: "query", placeholder: "50" },
@@ -844,11 +863,18 @@ def channel(channel_id):
     """
     チャンネルのメタ情報+投稿動画一覧(flat抽出)。?limit=&offset=で範囲指定。
     channel_id は '@handle'、'UCxxxx'、素のハンドル名、フルURLのいずれでも指定可能。
+
+    アバター/バナーはyt-dlpのextract_flatだけでは取れない(特にバナー)ため、
+    チャンネルページのytInitialDataを別途取得してrelated/trendingと同じ要領で
+    "avatar" / "banner" というキーを持つノードを総当たりで探している。
+    見つかった画像はサーバー側で取得してbase64のdata URIにしてから返す
+    (ホットリンク周りの問題を避けるため。?base64=0を付けると元のURLのままにできる)。
     """
     limit = max(1, min(int(request.args.get("limit", 50)), 500))
     offset = max(0, int(request.args.get("offset", 0)))
+    want_base64 = request.args.get("base64", "1") != "0"
 
-    key = f"channel:{channel_id}:{limit}:{offset}"
+    key = f"channel:{channel_id}:{limit}:{offset}:{want_base64}"
     cached = _response_cache_get(key)
     if cached is not None:
         return jsonify(cached)
@@ -857,6 +883,27 @@ def channel(channel_id):
     with _track_processing(channel_id, "channel"):
         info = _extract_flat(url, playliststart=offset + 1, playlistend=offset + limit)
 
+        avatar_url = None
+        banner_url = None
+        try:
+            page_resp = _http.get(_add_lang_params(url), timeout=10)
+            if page_resp.status_code < 400:
+                yt_data = _extract_yt_initial_data(page_resp.text)
+                if yt_data:
+                    avatar_url = _find_named_image_url(yt_data, "avatar")
+                    banner_url = _find_named_image_url(yt_data, "banner")
+        except requests.RequestException:
+            pass
+
+        if not avatar_url:
+            # ytInitialDataから拾えなかった場合、yt-dlp側のthumbnailsにフォールバック
+            thumbs = info.get("thumbnails") or []
+            if thumbs:
+                avatar_url = thumbs[-1].get("url")
+
+        avatar_b64 = _image_to_data_uri(avatar_url) if want_base64 else None
+        banner_b64 = _image_to_data_uri(banner_url) if want_base64 else None
+
     entries = [_slim_entry(e) for e in (info.get("entries") or [])]
     result = _json_safe({
         "channel_id": info.get("channel_id") or info.get("id") or channel_id,
@@ -864,6 +911,10 @@ def channel(channel_id):
         "channel_follower_count": info.get("channel_follower_count"),
         "description": info.get("description"),
         "webpage_url": info.get("webpage_url"),
+        "avatar": avatar_url,
+        "avatar_base64": avatar_b64,
+        "banner": banner_url,
+        "banner_base64": banner_b64,
         "entry_count_total": info.get("playlist_count"),
         "entry_count_returned": len(entries),
         "entries": entries,
@@ -1013,6 +1064,55 @@ def _walk(node):
             yield from _walk(item)
 
 
+def _find_thumbnails_under(node):
+    # dictの中のどこかにある "thumbnails": [...] を深さ問わず探して返す。
+    # avatar/bannerのJSON構造はチャンネルによって微妙に階層が違うことがあるので、
+    # ピンポイントでパスを決め打ちせずに総当たりする。
+    if isinstance(node, dict):
+        thumbs = node.get("thumbnails")
+        if isinstance(thumbs, list) and thumbs:
+            return thumbs
+        for v in node.values():
+            found = _find_thumbnails_under(v)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_thumbnails_under(item)
+            if found:
+                return found
+    return None
+
+
+def _find_named_image_url(yt_data, key_name):
+    """ytInitialDataの中から、例えば "avatar" や "banner" というキーを持つノードを探し、
+    その中に埋まっているサムネイル一覧の一番大きい画像URLを返す。見つからなければNone。"""
+    for node in _walk(yt_data):
+        if key_name in node:
+            thumbs = _find_thumbnails_under(node[key_name])
+            if thumbs:
+                return thumbs[-1].get("url")
+    return None
+
+
+def _image_to_data_uri(url):
+    """画像URLをサーバー側で取得してbase64のdata URIにして返す(ホットリンク周りの問題を避けるため)。
+    取得に失敗したらNoneを返すだけで、呼び出し側は気にせずそのまま使える。"""
+    if not url:
+        return None
+    try:
+        resp = _http.get(url, timeout=10)
+    except requests.RequestException:
+        return None
+    if resp.status_code >= 400 or not resp.content:
+        return None
+    content_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+    if not content_type.startswith("image/"):
+        content_type = "image/jpeg"
+    b64 = base64.b64encode(resp.content).decode("ascii")
+    return f"data:{content_type};base64,{b64}"
+
+
 # 動画レンダラーからチャンネルIDを拾うための候補パス。
 # レンダラーの種類(compactVideoRenderer / videoRenderer / gridVideoRenderer 等)によって
 # 微妙に構造が違うので、上から順に試して最初に見つかったものを使う。
@@ -1097,6 +1197,11 @@ _http.headers.update({
     ),
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
 })
+# Cookie無しでYouTubeに直接アクセスすると、地域によっては本来のページの代わりに
+# 「続行する前に」のクッキー同意画面が返ってきて中身が空になることがある。
+# この同意済みクッキーを最初から持たせておくことでその画面を回避する。
+_http.cookies.set("CONSENT", "YES+1", domain=".youtube.com")
+_http.cookies.set("SOCS", "CAI", domain=".youtube.com")
 
 
 @app.get("/api/related/<video_id>")
@@ -1118,7 +1223,7 @@ def related(video_id):
     watch_url = _resolve_url(video_id)
     with _track_processing(video_id, "related"):
         try:
-            resp = _http.get(watch_url, timeout=15)
+            resp = _http.get(_add_lang_params(watch_url), timeout=15)
         except requests.RequestException as e:
             raise ApiError(502, f"failed to fetch watch page: {e}")
         if resp.status_code >= 400:
@@ -1157,6 +1262,9 @@ def trending():
     relatedと同じ「動画カードっぽいノードを片っ端から拾う」方式なので構造変更にもある程度強い。
     視聴履歴を反映した「あなたへのおすすめ」ではない点に注意(そもそもログインしていないので
     YouTube側もパーソナライズしたフィードを返してこない)。
+
+    /feed/trending が(地域やアクセス状況によって)空の結果しか返さない場合があるため、
+    その時はYouTubeのトップページを代わりに見に行くフォールバックを入れてある。
     """
     limit = max(1, min(int(request.args.get("limit", 24)), 50))
 
@@ -1165,23 +1273,37 @@ def trending():
     if cached is not None:
         return jsonify(cached)
 
-    with _track_processing("trending", "trending"):
-        try:
-            resp = _http.get("https://www.youtube.com/feed/trending", timeout=15)
-        except requests.RequestException as e:
-            raise ApiError(502, f"failed to fetch trending page: {e}")
+    def _fetch_entries(url):
+        resp = _http.get(_add_lang_params(url), timeout=15)
         if resp.status_code >= 400:
-            raise ApiError(502, f"trending page returned HTTP {resp.status_code}")
+            return None, f"HTTP {resp.status_code}"
         yt_data = _extract_yt_initial_data(resp.text)
+        if yt_data is None:
+            return None, "ytInitialData not found"
+        return _parse_video_cards(yt_data, None, limit), None
 
-    if yt_data is None:
-        raise ApiError(
-            502,
-            "failed to parse ytInitialData from the trending page "
-            "(YouTube may have changed its page structure)",
-        )
+    with _track_processing("trending", "trending"):
+        entries = None
+        last_error = None
+        try:
+            entries, last_error = _fetch_entries("https://www.youtube.com/feed/trending")
+        except requests.RequestException as e:
+            last_error = str(e)
 
-    entries = _parse_video_cards(yt_data, None, limit)
+        if not entries:
+            # トレンドページが空/失敗ならトップページで代替を試みる
+            try:
+                fallback_entries, fallback_error = _fetch_entries("https://www.youtube.com/")
+                if fallback_entries:
+                    entries = fallback_entries
+                elif last_error is None:
+                    last_error = fallback_error
+            except requests.RequestException as e:
+                if last_error is None:
+                    last_error = str(e)
+
+    if not entries:
+        raise ApiError(502, f"failed to fetch trending feed: {last_error or 'no entries found'}")
 
     result = _json_safe({
         "method": "youtube_trending_page_scrape",
