@@ -1,3 +1,45 @@
+"""
+ytdlp_api - yt-dlp を使ったシンプルな動画情報/ストリーム一覧API
+UIなし(/api/statsのみUIあり)、API専用。Termux + ngrok での運用を想定。
+
+Flask + requests のみで構成(fastapi/pydanticは不使用。Rustビルド不要)。
+ffmpegも不要(HLSリアルタイム変換機能は廃止し、yt-dlpが把握しているm3u8直リンクのみ返す構成)。
+
+エンドポイント:
+  GET    /api                                  API一覧・説明・実行テスト用ページ(HTML)
+  GET    /api/search                           YouTube検索(?q=検索語&limit=件数)
+  GET    /api/playlist/{playlist_id}            プレイリストのメタ情報+収録動画一覧
+  GET    /api/channel/{channel_id}              チャンネルのメタ情報+投稿動画一覧
+  GET    /api/comments/{video_id}               動画のコメント一覧
+  GET    /api/related/{video_id}                関連動画(watch pageのytInitialDataを解析。非公式)
+  GET    /api/trending                          おすすめ/トレンドフィード(非ログイン・非パーソナライズ)
+  GET    /api/info/{video_id}                 動画の全メタデータ(ストリームURLは含まない)
+  GET    /api/stream/{video_id}                その動画の全ストリームURL一覧 + HLS(m3u8)直リンク(あれば)
+  GET    /api/health                           死活監視
+  GET    /api/stats                            worker/処理中/キャッシュ/稼働時間を見るダッシュボード(HTML)
+  GET    /api/stats/data                       ↑と同じ内容をJSONで返す(ポーリング用)
+  GET    /api/workers                          このサーバー(worker)の情報一覧
+  GET    /api/processing                       現在処理中のvideo_id一覧(経過時間つき)
+  GET    /api/cache                            これまでに解決した動画の一覧(Video ID / Title)
+  GET    /api/cache/{video_id}                 キャッシュ済みの単一動画の情報
+  DELETE /api/cache/{video_id}                 キャッシュから削除
+
+video_id には
+  - YouTubeの動画ID (例: dQw4w9WgXcQ)
+  - もしくはURLエンコードした完全なURL (例: https%3A%2F%2Fvimeo.com%2F12345)
+のどちらも指定できます。単純な文字列(URLでない)場合は自動的に
+https://www.youtube.com/watch?v={video_id} として扱われます。
+
+レスポンスキャッシュについて:
+  /api/info と /api/stream は、同じvideo_idに対する結果を7時間(YTDLP_API_CACHE_TTL_SECONDS)
+  保存し、期間内の再リクエストはyt-dlpを呼ばずに即座にキャッシュを返します。
+  レスポンスの "_cache" フィールドで hit/miss と残り有効時間が確認できます。
+  ※ CDN側の直リンク(googlevideo等)は数時間で失効することがあるため、
+     再生に失敗する場合はキャッシュ有効期間内でも一度削除して取り直してください
+     (DELETE /api/cache/{video_id} は「一覧用インデックス」のみを消すため、
+      レスポンスキャッシュ自体は自然失効を待つか、サーバー再起動で消えます)。
+"""
+
 import os
 import re
 import json
@@ -386,6 +428,10 @@ const ENDPOINTS = [
     params: [
       { name: "video_id", in: "path", placeholder: "dQw4w9WgXcQ" },
       { name: "limit", in: "query", placeholder: "10" },
+    ] },
+  { method: "GET", path: "/api/trending", desc: "おすすめ/トレンドフィード(非ログイン・非パーソナライズ)。トップページ表示用。",
+    params: [
+      { name: "limit", in: "query", placeholder: "24" },
     ] },
   { method: "GET", path: "/api/info/{video_id}", desc: "動画の全メタデータを取得(ストリームURLは含まない)。7時間キャッシュ。",
     params: [{ name: "video_id", in: "path", placeholder: "dQw4w9WgXcQ" }] },
@@ -996,11 +1042,13 @@ def _looks_like_video(node):
     )
 
 
-def _parse_related(yt_data, own_video_id, limit):
+def _parse_video_cards(yt_data, exclude_id, limit):
     """
-    ytInitialDataの中から動画カードっぽいノードを片っ端から拾って関連動画リストにする。
-    決め打ちのJSONパスに頼らないので、YouTube側がsecondaryResultsの階層構造を
-    変えてきても(レンダラー自体の形が大きく変わらない限り)そのまま動く。
+    ytInitialDataの中から動画カードっぽいノードを片っ端から拾ってリストにする。
+    決め打ちのJSONパスに頼らないので、YouTube側が階層構造を変えてきても
+    (レンダラー自体の形が大きく変わらない限り)そのまま動く。
+    関連動画(watch pageのsecondaryResults)にもトレンド(トップページのrichGrid)にも
+    そのまま使い回せる。
     """
     seen = set()
     entries = []
@@ -1010,7 +1058,7 @@ def _parse_related(yt_data, own_video_id, limit):
             continue
 
         video_id = node["videoId"]
-        if video_id == own_video_id or video_id in seen:
+        if video_id == exclude_id or video_id in seen:
             continue
         seen.add(video_id)
 
@@ -1084,7 +1132,7 @@ def related(video_id):
             "(YouTube may have changed its page structure, or this isn't a YouTube video)",
         )
 
-    entries = _parse_related(yt_data, video_id, limit)
+    entries = _parse_video_cards(yt_data, video_id, limit)
 
     result = _json_safe({
         "video_id": video_id,
@@ -1095,6 +1143,54 @@ def related(video_id):
         "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
     })
     _response_cache_set(key, "related", video_id, result)
+
+    result = dict(result)
+    result["_cache"] = {"hit": False, "age_seconds": 0, "expires_in_seconds": RESPONSE_CACHE_TTL_SECONDS}
+    return jsonify(result)
+
+
+@app.get("/api/trending")
+def trending():
+    """
+    おすすめ/トレンドフィード。ログイン無し・パーソナライズ無しの状態で
+    https://www.youtube.com/feed/trending が返すページのytInitialDataを解析している。
+    relatedと同じ「動画カードっぽいノードを片っ端から拾う」方式なので構造変更にもある程度強い。
+    視聴履歴を反映した「あなたへのおすすめ」ではない点に注意(そもそもログインしていないので
+    YouTube側もパーソナライズしたフィードを返してこない)。
+    """
+    limit = max(1, min(int(request.args.get("limit", 24)), 50))
+
+    key = f"trending:{limit}"
+    cached = _response_cache_get(key)
+    if cached is not None:
+        return jsonify(cached)
+
+    with _track_processing("trending", "trending"):
+        try:
+            resp = _http.get("https://www.youtube.com/feed/trending", timeout=15)
+        except requests.RequestException as e:
+            raise ApiError(502, f"failed to fetch trending page: {e}")
+        if resp.status_code >= 400:
+            raise ApiError(502, f"trending page returned HTTP {resp.status_code}")
+        yt_data = _extract_yt_initial_data(resp.text)
+
+    if yt_data is None:
+        raise ApiError(
+            502,
+            "failed to parse ytInitialData from the trending page "
+            "(YouTube may have changed its page structure)",
+        )
+
+    entries = _parse_video_cards(yt_data, None, limit)
+
+    result = _json_safe({
+        "method": "youtube_trending_page_scrape",
+        "note": "YouTubeのトレンドページ(非ログイン・非パーソナライズ)から取得した動画一覧。",
+        "entry_count": len(entries),
+        "entries": entries,
+        "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
+    })
+    _response_cache_set(key, "trending", "trending", result)
 
     result = dict(result)
     result["_cache"] = {"hit": False, "age_seconds": 0, "expires_in_seconds": RESPONSE_CACHE_TTL_SECONDS}
