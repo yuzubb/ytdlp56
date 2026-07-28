@@ -22,7 +22,8 @@ ffmpegも不要(HLSリアルタイム変換機能は廃止し、yt-dlpが把握�
   GET    /api/processing                       現在処理中のvideo_id一覧(経過時間つき)
   GET    /api/cache                            これまでに解決した動画の一覧(Video ID / Title)
   GET    /api/cache/{video_id}                 キャッシュ済みの単一動画の情報
-  DELETE /api/cache/{video_id}                 キャッシュから削除
+  DELETE /api/cache/{video_id}                 キャッシュから削除(一覧インデックス+レスポンスキャッシュ)
+  DELETE /api/cache                            キャッシュを全部削除(強制リフレッシュ用)
 
 video_id には
   - YouTubeの動画ID (例: dQw4w9WgXcQ)
@@ -36,8 +37,7 @@ https://www.youtube.com/watch?v={video_id} として扱われます。
   レスポンスの "_cache" フィールドで hit/miss と残り有効時間が確認できます。
   ※ CDN側の直リンク(googlevideo等)は数時間で失効することがあるため、
      再生に失敗する場合はキャッシュ有効期間内でも一度削除して取り直してください
-     (DELETE /api/cache/{video_id} は「一覧用インデックス」のみを消すため、
-      レスポンスキャッシュ自体は自然失効を待つか、サーバー再起動で消えます)。
+     (DELETE /api/cache/{video_id} で個別に、DELETE /api/cache で全部まとめて削除できます)。
 """
 
 import os
@@ -517,8 +517,10 @@ const ENDPOINTS = [
     ] },
   { method: "GET", path: "/api/cache/{video_id}", desc: "キャッシュ済み単一動画の情報を取得。",
     params: [{ name: "video_id", in: "path", placeholder: "dQw4w9WgXcQ" }] },
-  { method: "DELETE", path: "/api/cache/{video_id}", desc: "一覧インデックスから削除する(レスポンスキャッシュは別途自然失効)。",
+  { method: "DELETE", path: "/api/cache/{video_id}", desc: "一覧インデックス+レスポンスキャッシュを削除する。",
     params: [{ name: "video_id", in: "path", placeholder: "dQw4w9WgXcQ" }] },
+  { method: "DELETE", path: "/api/cache", desc: "キャッシュを全部削除する(強制リフレッシュ用)。",
+    params: [] },
 ];
 
 function buildCard(ep, index) {
@@ -841,11 +843,36 @@ def cache_delete(video_id):
     return jsonify({"deleted": video_id})
 
 
+@app.delete("/api/cache")
+def cache_delete_all():
+    """一覧インデックス・レスポンスキャッシュ(7時間キャッシュ)を全部消す。
+    間違ったデータがキャッシュされてしまった時の強制リフレッシュ用。"""
+    with _CACHE_DB_LOCK, _db() as conn:
+        index_count = conn.execute("SELECT COUNT(*) AS c FROM cache").fetchone()["c"]
+        response_count = conn.execute("SELECT COUNT(*) AS c FROM response_cache").fetchone()["c"]
+        conn.execute("DELETE FROM cache")
+        conn.execute("DELETE FROM response_cache")
+    # 短時間キャッシュ(URL解決結果)もついでに消しておく
+    _STREAM_URL_CACHE.clear()
+    return jsonify({
+        "deleted": "all",
+        "index_entries_removed": index_count,
+        "response_cache_entries_removed": response_count,
+    })
+
+
 # ---------- search / playlist / channel / comments / related ----------
 
 @app.get("/api/search")
 def search():
-    """?q=検索語 でYouTube検索。一覧は高速化のためflat抽出(詳細は/api/info/{video_id}を別途叩く)。"""
+    """
+    ?q=検索語 でYouTube検索。
+
+    まずYouTubeの検索結果ページを直接スクレイピングする(related/trendingと同じ
+    「動画カードを総当たりで拾う」方式)。こちらだと各結果にチャンネルの小さい
+    アイコン画像(channel_thumbnail)も付いてくる。yt-dlpのflat検索(ytsearchN:)には
+    このアイコン情報が無いため、フォールバック用にとどめている。
+    """
     q = request.args.get("q")
     if not q:
         raise ApiError(400, "query parameter 'q' is required")
@@ -856,10 +883,23 @@ def search():
     if cached is not None:
         return jsonify(cached)
 
+    entries = None
     with _track_processing(f"search:{q}", "search"):
-        info = _extract_flat(f"ytsearch{limit}:{q}")
+        search_url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(q)
+        try:
+            resp = _fetch_page(_add_lang_params(search_url), timeout=15)
+            if resp.status_code < 400:
+                yt_data = _extract_yt_initial_data(resp.text)
+                if yt_data:
+                    entries = _parse_video_cards(yt_data, None, limit)
+        except ApiError:
+            pass
 
-    entries = [_slim_entry(e) for e in (info.get("entries") or [])]
+        if not entries:
+            # スクレイピングがダメだった場合のフォールバック(チャンネルアイコンは付かない)
+            info = _extract_flat(f"ytsearch{limit}:{q}")
+            entries = [_slim_entry(e) for e in (info.get("entries") or [])]
+
     result = _json_safe({
         "query": q,
         "result_count": len(entries),
@@ -935,18 +975,25 @@ def channel(channel_id):
 
         avatar_url = None
         banner_url = None
+        page_html = None
         try:
             page_resp = _fetch_page(_add_lang_params(url), timeout=10)
             if page_resp.status_code < 400:
-                yt_data = _extract_yt_initial_data(page_resp.text)
-                if yt_data:
-                    avatar_url = _find_named_image_url(yt_data, "avatar")
-                    banner_url = _find_named_image_url(yt_data, "banner")
+                page_html = page_resp.text
         except ApiError:
             pass
 
+        if page_html:
+            # og:imageメタタグが一番単純で壊れにくいので最優先で使う
+            avatar_url = _extract_og_image(page_html)
+            yt_data = _extract_yt_initial_data(page_html)
+            if yt_data:
+                if not avatar_url:
+                    avatar_url = _find_named_image_url(yt_data, "avatar")
+                banner_url = _find_named_image_url(yt_data, "banner")
+
         if not avatar_url:
-            # ytInitialDataから拾えなかった場合、yt-dlp側のthumbnailsにフォールバック
+            # それでもダメならyt-dlp側のthumbnailsにフォールバック
             thumbs = info.get("thumbnails") or []
             if thumbs:
                 avatar_url = thumbs[-1].get("url")
@@ -1216,6 +1263,23 @@ def _find_thumbnails_under(node):
     return None
 
 
+def _find_video_owner_avatar(yt_data):
+    """
+    watch pageのytInitialDataには"avatar"というキーがコメント投稿者や関連動画の
+    チャンネルなど何人分も含まれていて、単純に最初に見つかったものを使うと
+    別人のアイコンを拾ってしまうことがある。動画の投稿者情報は
+    "videoOwnerRenderer" というキーの下にまとまっているので、そこだけを狙って
+    アバター画像を探す(総当たりよりずっとピンポイント)。
+    """
+    for node in _walk(yt_data):
+        if "videoOwnerRenderer" in node:
+            owner = node["videoOwnerRenderer"]
+            thumbs = _find_thumbnails_under(owner.get("thumbnail") or owner)
+            if thumbs:
+                return thumbs[-1].get("url")
+    return None
+
+
 def _find_named_image_url(yt_data, key_name):
     """ytInitialDataの中から、例えば "avatar" や "banner" というキーを持つノードを探し、
     その中に埋まっているサムネイル一覧の一番大きい画像URLを返す。見つからなければNone。"""
@@ -1225,6 +1289,24 @@ def _find_named_image_url(yt_data, key_name):
             if thumbs:
                 return thumbs[-1].get("url")
     return None
+
+
+_OG_IMAGE_RE = re.compile(
+    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE
+)
+_OG_IMAGE_RE_ALT = re.compile(
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', re.IGNORECASE
+)
+
+
+def _extract_og_image(html):
+    """
+    ページのHTMLに埋まっている <meta property="og:image" content="..."> からURLを拾う。
+    ytInitialDataの中を総当たりで探すより単純で、YouTube側のページ構造変更の影響を
+    受けにくい。チャンネルページのog:imageはたいていアバター画像になっている。
+    """
+    m = _OG_IMAGE_RE.search(html) or _OG_IMAGE_RE_ALT.search(html)
+    return m.group(1) if m else None
 
 
 def _image_to_data_uri(url):
@@ -1253,6 +1335,13 @@ _CHANNEL_ID_PATHS = (
      "navigationEndpoint", "browseEndpoint", "browseId"),
     ("shortBylineText", "runs", 0, "navigationEndpoint", "browseEndpoint", "browseId"),
     ("longBylineText", "runs", 0, "navigationEndpoint", "browseEndpoint", "browseId"),
+)
+
+# 検索結果/関連動画/トレンドのカードに、投稿者の小さいアイコン画像が埋まっていることがある。
+# チャンネルIDと同じ場所(channelThumbnailSupportedRenderers)にぶら下がっていることが多い。
+_CHANNEL_THUMBNAIL_PATHS = (
+    ("channelThumbnailSupportedRenderers", "channelThumbnailWithLinkRenderer", "thumbnail", "thumbnails"),
+    ("channelThumbnail", "thumbnails"),
 )
 
 
@@ -1300,6 +1389,13 @@ def _parse_video_cards(yt_data, exclude_id, limit):
             if channel_id:
                 break
 
+        channel_thumbnail = None
+        for path in _CHANNEL_THUMBNAIL_PATHS:
+            thumbs = _dig(node, *path)
+            if thumbs:
+                channel_thumbnail = thumbs[-1].get("url")
+                break
+
         thumbnails = _dig(node, "thumbnail", "thumbnails") or []
 
         entries.append({
@@ -1307,6 +1403,7 @@ def _parse_video_cards(yt_data, exclude_id, limit):
             "title": _runs_text(node.get("title")),
             "channel": _runs_text(node.get("longBylineText") or node.get("shortBylineText")),
             "channel_id": channel_id,
+            "channel_thumbnail": channel_thumbnail,
             "length_text": _dig(node, "lengthText", "simpleText"),
             "view_count_text": _dig(node, "shortViewCountText", "simpleText") or _runs_text(node.get("viewCountText")),
             "thumbnail": thumbnails[-1]["url"] if thumbnails else None,
@@ -1523,7 +1620,10 @@ def info(video_id):
             if page_resp.status_code < 400:
                 yt_data = _extract_yt_initial_data(page_resp.text)
                 if yt_data:
-                    channel_avatar_url = _find_named_image_url(yt_data, "avatar")
+                    channel_avatar_url = _find_video_owner_avatar(yt_data)
+                    if not channel_avatar_url:
+                        # videoOwnerRendererが見つからない場合の最終手段
+                        channel_avatar_url = _find_named_image_url(yt_data, "avatar")
         except ApiError:
             pass
 
@@ -1612,7 +1712,16 @@ def proxy_stream(video_id):
     """
     format_id = request.args.get("format_id", "18")
     range_header = request.headers.get("Range")
-    fwd_headers = {"Range": range_header} if range_header else {}
+    # googlevideo等のCDNは、素のPython requestsのUser-Agent(python-requests/x.x)だと
+    # リクエストを弾いてくることがある。ブラウザっぽいヘッダを付けて回避する。
+    fwd_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+    }
+    if range_header:
+        fwd_headers["Range"] = range_header
 
     def _try_fetch(use_cache):
         url = _resolve_direct_url(video_id, format_id, use_cache=use_cache)
@@ -1642,9 +1751,13 @@ def proxy_stream(video_id):
 
     def gen():
         try:
-            for chunk in upstream.iter_content(65536):
+            for chunk in upstream.iter_content(262144):
                 if chunk:
                     yield chunk
+        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError):
+            # ブラウザ側がシーク/画質切替/ページ離脱等で接続を切っただけの、よくあるケース。
+            # サーバーログを例外で汚さないよう、ここで黙って終了する。
+            pass
         finally:
             upstream.close()
 
