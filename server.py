@@ -1,50 +1,3 @@
-"""
-ytdlp_api - yt-dlp を使ったシンプルな動画情報/ストリーム一覧API
-UIなし(/api/statsのみUIあり)、API専用。Termux + ngrok での運用を想定。
-
-Flask + requests のみで構成(fastapi/pydanticは不使用。Rustビルド不要)。
-ffmpegも不要(HLSリアルタイム変換機能は廃止し、yt-dlpが把握しているm3u8直リンクのみ返す構成)。
-
-エンドポイント:
-  GET    /api                                  API一覧・説明・実行テスト用ページ(HTML)
-  GET    /api/search                           YouTube検索(?q=検索語&limit=件数)
-  GET    /api/playlist/{playlist_id}            プレイリストのメタ情報+収録動画一覧
-  GET    /api/channel/{channel_id}              チャンネルのメタ情報+投稿動画一覧+アバター/バナー(base64)
-  GET    /api/comments/{video_id}               動画のコメント一覧
-  GET    /api/related/{video_id}                関連動画(watch pageのytInitialDataを解析。非公式)
-  GET    /api/trending                          このサイトで実際に視聴された動画のランキング
-  GET    /api/info/{video_id}                 動画の全メタデータ(ストリームURLは含まない)
-  GET    /api/stream/{video_id}                その動画の全ストリームURL一覧 + HLS(m3u8)直リンク(あれば)
-  GET    /api/health                           死活監視
-  GET    /api/stats                            worker/処理中/キャッシュ/稼働時間を見るダッシュボード(HTML)
-  GET    /api/stats/data                       ↑と同じ内容をJSONで返す(ポーリング用)
-  GET    /api/workers                          このサーバー(worker)の情報一覧
-  GET    /api/processing                       現在処理中のvideo_id一覧(経過時間つき)
-  GET    /api/cache                            これまでに解決した動画の一覧(Video ID / Title)
-  GET    /api/cache/{video_id}                 キャッシュ済みの単一動画の情報
-  DELETE /api/cache/{video_id}                 キャッシュから削除(一覧インデックス+レスポンスキャッシュ)
-  DELETE /api/cache                            キャッシュを全部削除(強制リフレッシュ用)
-
-video_id には
-  - YouTubeの動画ID (例: dQw4w9WgXcQ)
-  - もしくはURLエンコードした完全なURL (例: https%3A%2F%2Fvimeo.com%2F12345)
-のどちらも指定できます。単純な文字列(URLでない)場合は自動的に
-https://www.youtube.com/watch?v={video_id} として扱われます。
-
-cookies.txtについて:
-  server.pyと同じディレクトリに "cookies.txt" (Netscape形式)を置くと、
-  yt-dlp・生スクレイピングの両方で自動的に使われます(年齢制限動画やBot判定回避に有効)。
-  環境変数 YTDLP_API_COOKIES_FILE で置き場所を変更できます。詳しくはREADME参照。
-
-レスポンスキャッシュについて:
-  /api/info と /api/stream は、同じvideo_idに対する結果を7時間(YTDLP_API_CACHE_TTL_SECONDS)
-  保存し、期間内の再リクエストはyt-dlpを呼ばずに即座にキャッシュを返します。
-  レスポンスの "_cache" フィールドで hit/miss と残り有効時間が確認できます。
-  ※ CDN側の直リンク(googlevideo等)は数時間で失効することがあるため、
-     再生に失敗する場合はキャッシュ有効期間内でも一度削除して取り直してください
-     (DELETE /api/cache/{video_id} で個別に、DELETE /api/cache で全部まとめて削除できます)。
-"""
-
 import os
 import re
 import json
@@ -431,7 +384,16 @@ def _ydl_opts(extra=None):
         "nocheckcertificate": True,
         # YouTubeは視聴環境の言語設定によっては、オリジナルが日本語のタイトルでも
         # 自動翻訳された英語タイトルを返してくることがある。明示的にjaを指定して抑える。
-        "extractor_args": {"youtube": {"lang": ["ja"]}},
+        # player_client=mweb は PO Token (bgutil provider) が対応しているクライアントを
+        # 明示的に選ぶための指定。他のクライアント(android_vr等)だとPO Tokenがあっても
+        # LOGIN_REQUIREDになることが確認できたため、mwebに固定している。
+        "extractor_args": {"youtube": {"lang": ["ja"], "player_client": ["mweb"]}},
+        # 2025年後半以降、署名解読(nシグネチャ等)に外部JSランタイムが事実上必須になった。
+        # Termuxにはdeno(既定ランタイム)が無いのでnodeを明示的に有効化する。
+        "js_runtimes": {"node": {}},
+        # 署名解読スクリプト本体(EJS)をGitHubから取得することを許可する設定。
+        # これが無いと "Signature solving failed" で一部/全部のフォーマットが欠落する。
+        "remote_components": ["ejs:github"],
     }
     if os.path.isfile(COOKIES_FILE_PATH):
         opts["cookiefile"] = COOKIES_FILE_PATH
@@ -486,7 +448,9 @@ def _extract_flat(url, playliststart=None, playlistend=None):
         "no_warnings": True,
         "nocheckcertificate": True,
         "extract_flat": "in_playlist",
-        "extractor_args": {"youtube": {"lang": ["ja"]}},
+        "extractor_args": {"youtube": {"lang": ["ja"], "player_client": ["mweb"]}},
+        "js_runtimes": {"node": {}},
+        "remote_components": ["ejs:github"],
     }
     if os.path.isfile(COOKIES_FILE_PATH):
         opts["cookiefile"] = COOKIES_FILE_PATH
