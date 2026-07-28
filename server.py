@@ -12,7 +12,7 @@ ffmpegも不要(HLSリアルタイム変換機能は廃止し、yt-dlpが把握�
   GET    /api/channel/{channel_id}              チャンネルのメタ情報+投稿動画一覧+アバター/バナー(base64)
   GET    /api/comments/{video_id}               動画のコメント一覧
   GET    /api/related/{video_id}                関連動画(watch pageのytInitialDataを解析。非公式)
-  GET    /api/trending                          おすすめ/トレンドフィード(非ログイン・非パーソナライズ)
+  GET    /api/trending                          このサイトで実際に視聴された動画のランキング
   GET    /api/info/{video_id}                 動画の全メタデータ(ストリームURLは含まない)
   GET    /api/stream/{video_id}                その動画の全ストリームURL一覧 + HLS(m3u8)直リンク(あれば)
   GET    /api/health                           死活監視
@@ -30,6 +30,11 @@ video_id には
   - もしくはURLエンコードした完全なURL (例: https%3A%2F%2Fvimeo.com%2F12345)
 のどちらも指定できます。単純な文字列(URLでない)場合は自動的に
 https://www.youtube.com/watch?v={video_id} として扱われます。
+
+cookies.txtについて:
+  server.pyと同じディレクトリに "cookies.txt" (Netscape形式)を置くと、
+  yt-dlp・生スクレイピングの両方で自動的に使われます(年齢制限動画やBot判定回避に有効)。
+  環境変数 YTDLP_API_COOKIES_FILE で置き場所を変更できます。詳しくはREADME参照。
 
 レスポンスキャッシュについて:
   /api/info と /api/stream は、同じvideo_idに対する結果を7時間(YTDLP_API_CACHE_TTL_SECONDS)
@@ -49,6 +54,7 @@ import sqlite3
 import threading
 import urllib.parse
 import urllib.request
+import http.cookiejar
 import urllib.error
 import contextlib
 from datetime import datetime
@@ -62,8 +68,119 @@ app = Flask(__name__)
 TMP_DIR_PATH = os.environ.get("YTDLP_API_TMP", os.path.join(os.path.expanduser("~"), "ytdlp_api_tmp"))
 os.makedirs(TMP_DIR_PATH, exist_ok=True)
 
+# cookies.txt (Netscape形式)。年齢制限/メンバー限定動画へのアクセスや、
+# Bot判定の回避に使う。既定ではserver.pyと同じディレクトリに置くだけで拾われる。
+# 無ければ何もしない(これまで通りcookie無しで動く)。
+COOKIES_FILE_PATH = os.environ.get(
+    "YTDLP_API_COOKIES_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt"),
+)
+
+
+def _load_cookiejar():
+    """cookies.txt (Netscape形式)を読み込む。無い/壊れてる場合はNoneを返すだけで、
+    呼び出し側はcookie無しの状態にフォールバックできる。"""
+    if not os.path.isfile(COOKIES_FILE_PATH):
+        return None
+    jar = http.cookiejar.MozillaCookieJar(COOKIES_FILE_PATH)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except (OSError, http.cookiejar.LoadError):
+        return None
+    return jar
+
+
+def _cookie_header_string():
+    """urllib(_fetch_page)用に、cookies.txtの中身をCookieヘッダの文字列にする。
+    consent回避用のCONSENT/SOCSは常に含め、cookies.txtがあればそれも足す。"""
+    parts = ["CONSENT=YES+1", "SOCS=CAI"]
+    jar = _load_cookiejar()
+    if jar:
+        for cookie in jar:
+            parts.append(f"{cookie.name}={cookie.value}")
+    return "; ".join(parts)
+
+
 # /api/info, /api/stream の結果を保存する期間
 RESPONSE_CACHE_TTL_SECONDS = int(os.environ.get("YTDLP_API_CACHE_TTL_SECONDS", str(7 * 3600)))  # 7時間
+
+# キャッシュ削除など破壊的な操作を保護するパスワード。未設定だと誰でも削除できてしまうので、
+# 未設定の場合は削除系エンドポイントを常に拒否する(空文字列だと事故で誰でも通ってしまうため)。
+ADMIN_PASSWORD = os.environ.get("YTDLP_API_ADMIN_PASSWORD", "")
+
+
+def _require_admin_password():
+    if not ADMIN_PASSWORD:
+        raise ApiError(503, "admin password is not configured on the server (set YTDLP_API_ADMIN_PASSWORD)")
+    supplied = request.args.get("password", "")
+    if supplied != ADMIN_PASSWORD:
+        raise ApiError(403, "invalid password")
+
+
+# ---------- 自前トレンド (このサーバー経由で実際に視聴された動画の集計) ----------
+#
+# YouTube公式のトレンドページのスクレイピングはBot対策等で不安定だったため、
+# 代わりに「このAPI経由で/api/infoが叩かれた回数」を自前で集計してトレンドとして使う。
+# .jsonファイルに素朴に貯めていくだけの、種類別に分けたシンプルな構成。
+
+TRENDING_DATA_DIR = os.path.join(TMP_DIR_PATH, "trending_data")
+os.makedirs(TRENDING_DATA_DIR, exist_ok=True)
+VIEWS_JSON_PATH = os.path.join(TRENDING_DATA_DIR, "views.json")  # video_id -> 視聴統計
+_TRENDING_LOCK = threading.Lock()
+
+
+def _load_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_json_file(path, data):
+    # 書き込み中にプロセスが落ちてファイルが壊れないよう、一時ファイルに書いてから置き換える
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
+def _record_view(video_id, data):
+    """/api/info が呼ばれるたびに1回分の視聴として記録する。"""
+    with _TRENDING_LOCK:
+        views = _load_json_file(VIEWS_JSON_PATH)
+        entry = views.get(video_id, {"view_count": 0})
+        entry["view_count"] = entry.get("view_count", 0) + 1
+        entry["title"] = data.get("title") or entry.get("title")
+        entry["channel"] = data.get("channel") or data.get("uploader") or entry.get("channel")
+        entry["channel_id"] = data.get("channel_id") or entry.get("channel_id")
+        entry["thumbnail"] = data.get("thumbnail") or entry.get("thumbnail")
+        entry["duration"] = data.get("duration") or entry.get("duration")
+        entry["last_viewed"] = time.time()
+        views[video_id] = entry
+        _save_json_file(VIEWS_JSON_PATH, views)
+
+
+def _get_local_trending(limit):
+    with _TRENDING_LOCK:
+        views = _load_json_file(VIEWS_JSON_PATH)
+    ranked = sorted(views.items(), key=lambda kv: kv[1].get("view_count", 0), reverse=True)
+    entries = []
+    for video_id, entry in ranked[:limit]:
+        entries.append({
+            "video_id": video_id,
+            "title": entry.get("title"),
+            "channel": entry.get("channel"),
+            "channel_id": entry.get("channel_id"),
+            "channel_thumbnail": None,
+            "thumbnail": entry.get("thumbnail"),
+            "duration": entry.get("duration"),
+            "view_count_text": f"このサイトで{entry.get('view_count', 0)}回視聴",
+            "length_text": None,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+        })
+    return entries
+
 
 # /api/proxy-stream が使う、フォーマットごとのCDN直リンクの短時間キャッシュ
 _STREAM_URL_CACHE = {}
@@ -280,7 +397,6 @@ _PAGE_HEADERS = {
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     ),
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-    "Cookie": "CONSENT=YES+1; SOCS=CAI",
 }
 
 
@@ -289,8 +405,11 @@ def _fetch_page(url, timeout=15):
     YouTubeの生HTMLページを取ってくる。requestsではなくPython標準ライブラリ(urllib)を
     使っている。requests(urllib3)だとブロックされるケースでも、urllibだとTLS/HTTPの
     フィンガープリントが変わって通ることがあるため、生スクレイピング系はこちらに統一した。
+    cookies.txtが置いてあれば、そのcookieも一緒に送る(consent回避用のCONSENT/SOCSは常に付与)。
     """
-    req = urllib.request.Request(url, headers=_PAGE_HEADERS)
+    headers = dict(_PAGE_HEADERS)
+    headers["Cookie"] = _cookie_header_string()
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = resp.getcode()
@@ -314,6 +433,8 @@ def _ydl_opts(extra=None):
         # 自動翻訳された英語タイトルを返してくることがある。明示的にjaを指定して抑える。
         "extractor_args": {"youtube": {"lang": ["ja"]}},
     }
+    if os.path.isfile(COOKIES_FILE_PATH):
+        opts["cookiefile"] = COOKIES_FILE_PATH
     if extra:
         extra = dict(extra)
         # extractor_argsは単純にdict.updateすると丸ごと上書きされてlang指定が
@@ -367,6 +488,8 @@ def _extract_flat(url, playliststart=None, playlistend=None):
         "extract_flat": "in_playlist",
         "extractor_args": {"youtube": {"lang": ["ja"]}},
     }
+    if os.path.isfile(COOKIES_FILE_PATH):
+        opts["cookiefile"] = COOKIES_FILE_PATH
     if playliststart is not None:
         opts["playliststart"] = playliststart
     if playlistend is not None:
@@ -835,6 +958,7 @@ def cache_get(video_id):
 
 @app.delete("/api/cache/<video_id>")
 def cache_delete(video_id):
+    _require_admin_password()
     with _CACHE_DB_LOCK, _db() as conn:
         cur = conn.execute("DELETE FROM cache WHERE video_id = ?", (video_id,))
         conn.execute("DELETE FROM response_cache WHERE video_id = ?", (video_id,))
@@ -846,7 +970,9 @@ def cache_delete(video_id):
 @app.delete("/api/cache")
 def cache_delete_all():
     """一覧インデックス・レスポンスキャッシュ(7時間キャッシュ)を全部消す。
-    間違ったデータがキャッシュされてしまった時の強制リフレッシュ用。"""
+    間違ったデータがキャッシュされてしまった時の強制リフレッシュ用。
+    ?password= がYTDLP_API_ADMIN_PASSWORDと一致しないと実行できない。"""
+    _require_admin_password()
     with _CACHE_DB_LOCK, _db() as conn:
         index_count = conn.execute("SELECT COUNT(*) AS c FROM cache").fetchone()["c"]
         response_count = conn.execute("SELECT COUNT(*) AS c FROM response_cache").fetchone()["c"]
@@ -988,6 +1114,9 @@ def channel(channel_id):
             avatar_url = _extract_og_image(page_html)
             yt_data = _extract_yt_initial_data(page_html)
             if yt_data:
+                if not avatar_url:
+                    # channelMetadataRendererを狙い撃ち(汎用の"avatar"総当たりより確実)
+                    avatar_url = _find_channel_metadata_avatar(yt_data)
                 if not avatar_url:
                     avatar_url = _find_named_image_url(yt_data, "avatar")
                 banner_url = _find_named_image_url(yt_data, "banner")
@@ -1263,6 +1392,21 @@ def _find_thumbnails_under(node):
     return None
 
 
+def _find_channel_metadata_avatar(yt_data):
+    """
+    チャンネルページのアバターを狙い撃ちする。"channelMetadataRenderer" は
+    YouTubeのチャンネルページで昔から安定してavatar/description/keywords等を
+    まとめて持っているキーなので、og:imageや汎用の"avatar"総当たりより確実なことが多い。
+    """
+    for node in _walk(yt_data):
+        if "channelMetadataRenderer" in node:
+            meta = node["channelMetadataRenderer"]
+            thumbs = _find_thumbnails_under(meta.get("avatar") or meta)
+            if thumbs:
+                return thumbs[-1].get("url")
+    return None
+
+
 def _find_video_owner_avatar(yt_data):
     """
     watch pageのytInitialDataには"avatar"というキーがコメント投稿者や関連動画の
@@ -1432,6 +1576,12 @@ _http.headers.update({
 _http.cookies.set("CONSENT", "YES+1", domain=".youtube.com")
 _http.cookies.set("SOCS", "CAI", domain=".youtube.com")
 
+# cookies.txtがあれば、こちらのセッション(画像取得等に使う)にも反映しておく。
+_cookiejar_at_startup = _load_cookiejar()
+if _cookiejar_at_startup:
+    for _cookie in _cookiejar_at_startup:
+        _http.cookies.set(_cookie.name, _cookie.value, domain=_cookie.domain or ".youtube.com")
+
 
 @app.get("/api/related/<video_id>")
 def related(video_id):
@@ -1483,77 +1633,26 @@ def related(video_id):
 @app.get("/api/trending")
 def trending():
     """
-    おすすめ/トレンドフィード。ログイン無し・パーソナライズ無しの状態で
-    https://www.youtube.com/feed/trending の動画一覧を返す。
+    おすすめ/トレンドフィード。
 
-    まずyt-dlp自体の抽出機能(search/playlist/channelと同じ_extract_flat)を試す。
-    yt-dlpはBotガード回避やページ構造変更への追従が activelyメンテナンスされていて、
-    自前のytInitialDataスクレイピングより頑健なため。それでも失敗した場合のみ、
-    生スクレイピング(related等と同じ「動画カードを総当たりで拾う」方式)にフォールバックする。
-    視聴履歴を反映した「あなたへのおすすめ」ではない点に注意(そもそもログインしていないので
-    YouTube側もパーソナライズしたフィードを返してこない)。
+    YouTube公式のトレンドページのスクレイピングは不安定だったため、代わりに
+    「このAPI経由で実際に視聴された動画」の集計をトレンドとして返す方式に変更した。
+    誰もまだ見ていない状態ではentriesが空になる(YouTube本家のトレンドとは無関係)。
     """
-    limit = max(1, min(int(request.args.get("limit", 24)), 50))
-
-    key = f"trending:{limit}"
-    cached = _response_cache_get(key)
-    if cached is not None:
-        return jsonify(cached)
-
-    entries = None
-    last_error = None
-    method = None
+    limit = max(1, min(int(request.args.get("limit", 24)), 100))
 
     with _track_processing("trending", "trending"):
-        # 1. yt-dlp自体の抽出を試す(一番頑健)
-        try:
-            info = _extract_flat("https://www.youtube.com/feed/trending", playlistend=limit)
-            flat_entries = [_slim_entry(e) for e in (info.get("entries") or [])]
-            if flat_entries:
-                entries = flat_entries
-                method = "yt_dlp_extract"
-        except ApiError as e:
-            last_error = e.message
+        entries = _get_local_trending(limit)
 
-        # 2. ダメなら自前のytInitialDataスクレイピング(トレンドページ→トップページの順)
-        if not entries:
-            def _fetch_entries(url):
-                try:
-                    resp = _fetch_page(_add_lang_params(url), timeout=15)
-                except ApiError as e:
-                    return None, e.message
-                if resp.status_code >= 400:
-                    return None, f"HTTP {resp.status_code}"
-                yt_data = _extract_yt_initial_data(resp.text)
-                if yt_data is None:
-                    return None, "ytInitialData not found"
-                return _parse_video_cards(yt_data, None, limit), None
-
-            scraped_entries, scrape_error = _fetch_entries("https://www.youtube.com/feed/trending")
-            if not scraped_entries:
-                scraped_entries, fallback_error = _fetch_entries("https://www.youtube.com/")
-                scrape_error = scrape_error or fallback_error
-            if scraped_entries:
-                entries = scraped_entries
-                method = "youtube_page_scrape"
-            elif last_error is None:
-                last_error = scrape_error
-
-    if not entries:
-        raise ApiError(502, f"failed to fetch trending feed: {last_error or 'no entries found'}")
-
-    result = _json_safe({
-        "method": method,
-        "note": "YouTubeのトレンドページ(非ログイン・非パーソナライズ)から取得した動画一覧。",
+    return jsonify(_json_safe({
+        "method": "local_usage_based",
+        "note": (
+            "YouTube公式のトレンドではなく、このサイトを経由して実際に視聴された動画を"
+            "視聴回数順に並べたものです。まだ誰も見ていない動画は出てきません。"
+        ),
         "entry_count": len(entries),
         "entries": entries,
-        "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
-    })
-    _response_cache_set(key, "trending", "trending", result)
-
-    result = dict(result)
-    result["_cache"] = {"hit": False, "age_seconds": 0, "expires_in_seconds": RESPONSE_CACHE_TTL_SECONDS}
-    return jsonify(result)
+    }))
 
 
 # ---------- info (ストリームURLは含まない全メタデータ) ----------
@@ -1606,6 +1705,7 @@ def info(video_id):
     key = f"info:{video_id}"
     cached = _response_cache_get(key)
     if cached is not None:
+        _record_view(video_id, cached)
         return jsonify(cached)
 
     with _track_processing(video_id, "info"):
@@ -1631,6 +1731,7 @@ def info(video_id):
     result["channel_avatar"] = channel_avatar_url
     result["channel_avatar_base64"] = _image_to_data_uri(channel_avatar_url) if want_base64 else None
     _response_cache_set(key, "info", video_id, result)
+    _record_view(video_id, result)
 
     result = dict(result)
     result["_cache"] = {
