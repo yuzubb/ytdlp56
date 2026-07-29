@@ -132,31 +132,16 @@ def _get_or_create_secret(env_var_name, file_name, length=48):
 
 ADMIN_PASSWORD = _get_or_create_secret("YTDLP_API_ADMIN_PASSWORD", "admin_password.txt")
 
-API_SHARED_SECRET = _get_or_create_secret("YTDLP_API_SHARED_SECRET", "shared_secret.txt")
-
-_SECRET_EXEMPT_PATHS = {"/api/health", "/api/stats", "/api/stats/data"}
-
 
 @app.before_request
-def _enforce_shared_secret():
-    """
-    フロントエンド以外からの直接アクセスを防ぐための門番。/api/ 配下は全部、
-    正しい合言葉(X-Internal-Secretヘッダ)を持っていないと弾く。
-    """
+def _log_api_access():
+    """/api/ 配下へのアクセスをログに残すだけ(認証はしない)。
+    キャッシュ削除等の破壊的操作は _require_admin_password() で別途保護している。"""
     path = request.path
     if not path.startswith("/api/"):
         return None
-
     client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "")
-    if path not in _SECRET_EXEMPT_PATHS:
-        print(f"[access] {client_ip} -> {request.method} {path}")
-
-    if path in _SECRET_EXEMPT_PATHS:
-        return None
-    supplied = request.headers.get("X-Internal-Secret", "")
-    if supplied != API_SHARED_SECRET:
-        print(f"[security] forbidden access attempt from {client_ip}: {request.method} {path}")
-        return jsonify({"detail": "forbidden"}), 403
+    print(f"[access] {client_ip} -> {request.method} {path}")
     return None
 
 
@@ -629,35 +614,9 @@ _API_DOCS_HTML = """<!doctype html>
   <h1>ytdlp_api</h1>
   <div class="sub">yt-dlp powered API (no UI, docs only) &middot; <a href="/api/stats">/api/stats ダッシュボードはこちら</a></div>
 
-  <div class="card">
-    <div class="desc">
-      /api/health, /api/stats を除く全エンドポイントは合言葉(X-Internal-Secret)が
-      一致しないと弾かれます。サーバー起動時のログ、または保存された shared_secret.txt を
-      確認して、ここに貼っておいてください(このブラウザだけに保存されます)。
-    </div>
-    <div class="params">
-      <label>合言葉(X-Internal-Secret)
-        <input type="password" id="apiSecretInput" placeholder="shared_secret.txtの中身">
-      </label>
-    </div>
-    <button class="run" id="apiSecretSaveBtn">保存</button>
-  </div>
-
   <div id="cards"></div>
 
 <script>
-const API_SECRET_STORAGE_KEY = "ytdlp_api_docs_secret";
-
-function apiSecretHeaders() {
-  const secret = localStorage.getItem(API_SECRET_STORAGE_KEY) || "";
-  return secret ? { "X-Internal-Secret": secret } : {};
-}
-
-document.getElementById("apiSecretInput").value = localStorage.getItem(API_SECRET_STORAGE_KEY) || "";
-document.getElementById("apiSecretSaveBtn").addEventListener("click", () => {
-  localStorage.setItem(API_SECRET_STORAGE_KEY, document.getElementById("apiSecretInput").value.trim());
-});
-
 const ENDPOINTS = [
   { method: "GET", path: "/api/health", desc: "死活監視", params: [] },
   { method: "GET", path: "/api/search", desc: "YouTube検索(flat抽出で高速)。",
@@ -772,7 +731,7 @@ function buildCard(ep, index) {
 
     const startedAt = performance.now();
     try {
-      const res = await fetch(url, { method: ep.method, headers: apiSecretHeaders() });
+      const res = await fetch(url, { method: ep.method });
       const elapsed = Math.round(performance.now() - startedAt);
       const text = await res.text();
       let pretty = text;
@@ -1056,29 +1015,21 @@ def search():
     """
     ?q=検索語 でYouTube検索。?continuation=続きのトークン で次のページを取得できる
     (無限スクロール用)。レスポンスの next_continuation を次回のリクエストに渡せばよい。
-    ?sp= でYouTube本家の検索フィルター(アップロード日/動画の長さ/並び替え/種類)を指定できる。
-    有効な値は _SEARCH_FILTER_VALUES を参照(未知の値は無視される)。
 
     まずYouTubeの検索結果ページを直接スクレイピングする(related/trendingと同じ
     「動画カードを総当たりで拾う」方式)。こちらだと各結果にチャンネルの小さい
     アイコン画像(channel_thumbnail)も付いてくる。yt-dlpのflat検索(ytsearchN:)には
     このアイコン情報が無いため、フォールバック用にとどめている
-    (ただしyt-dlpフォールバック時は続きのページ取得・フィルターは使えない)。
+    (ただしyt-dlpフォールバック時は続きのページ取得はできない)。
     """
     q = request.args.get("q")
     if not q:
         raise ApiError(400, "query parameter 'q' is required")
     limit = max(1, min(int(request.args.get("limit", 20)), 50))
     continuation_token = request.args.get("continuation")
-    sp = request.args.get("sp", "")
-    if sp not in _SEARCH_FILTER_VALUES:
-        sp = ""
 
     def _build_search_url():
-        url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(q)
-        if sp:
-            url += "&sp=" + urllib.parse.quote(sp)
-        return url
+        return "https://www.youtube.com/results?search_query=" + urllib.parse.quote(q)
 
     if continuation_token:
         with _track_processing(f"search:{q}", "search"):
@@ -1097,7 +1048,7 @@ def search():
             "next_continuation": next_token,
         }))
 
-    key = f"search:{q}:{limit}:{sp}"
+    key = f"search:{q}:{limit}"
     cached = _response_cache_get(key)
     if cached is not None:
         return jsonify(cached)
@@ -1676,21 +1627,6 @@ def _image_to_data_uri(url):
 # YouTube検索の ?sp= フィルター値。protobufをbase64エンコードした値で、
 # 複数条件を自由に組み合わせるには本来protobufのマージが必要になるため、
 # ここでは動作確認が取れている「単体で使える値」だけをホワイトリストにしている。
-_SEARCH_FILTER_VALUES = {
-    # アップロード日
-    "EgIIAg==": "今日",
-    "EgIIAw==": "今週",
-    # 動画の長さ
-    "EgIYAQ==": "4分未満",
-    "EgIYAg==": "20分以上",
-    # 種類
-    "EgIQAg==": "チャンネル",
-    "EgIQAw==": "再生リスト",
-    # 並び替え
-    "CAI=": "アップロード日順",
-    "CAM=": "視聴回数順",
-}
-
 _CHANNEL_ID_PATHS = (
     ("channelThumbnailSupportedRenderers", "channelThumbnailWithLinkRenderer",
      "navigationEndpoint", "browseEndpoint", "browseId"),
