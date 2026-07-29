@@ -50,9 +50,13 @@ import string
 import secrets
 import re
 import html as html_module
+import itsdangerous
+import werkzeug.security
 import json
 import time
 import base64
+import gzip
+import zlib
 import sqlite3
 import threading
 import urllib.parse
@@ -190,6 +194,106 @@ def _record_view(video_id, data):
         entry["last_viewed"] = time.time()
         views[video_id] = entry
         _save_json_file(VIEWS_JSON_PATH, views)
+
+
+AUTH_DATA_DIR = os.path.join(TMP_DIR_PATH, "auth_data")
+os.makedirs(AUTH_DATA_DIR, exist_ok=True)
+USERS_JSON_PATH = os.path.join(AUTH_DATA_DIR, "users.json")
+_AUTH_LOCK = threading.Lock()
+
+SESSION_MAX_AGE = 7 * 24 * 3600
+
+_SESSION_SECRET_KEY = _get_or_create_secret("YTDLP_API_SESSION_SECRET", "session_secret.txt")
+_session_serializer = itsdangerous.URLSafeTimedSerializer(_SESSION_SECRET_KEY, salt="yuzutube-session")
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _load_users():
+    with _AUTH_LOCK:
+        return _load_json_file(USERS_JSON_PATH)
+
+
+def _save_users(users):
+    with _AUTH_LOCK:
+        _save_json_file(USERS_JSON_PATH, users)
+
+
+def _create_session_token(email):
+    return _session_serializer.dumps({"email": email})
+
+
+def _verify_session_token(token):
+    """トークンが正しく、かつ1週間以内に発行されたものであればemailを返す。
+    改ざんされていたり期限切れなら例外を投げずにNoneを返すだけにしておく。"""
+    if not token:
+        return None
+    try:
+        data = _session_serializer.loads(token, max_age=SESSION_MAX_AGE)
+    except (itsdangerous.BadSignature, itsdangerous.SignatureExpired):
+        return None
+    return data.get("email")
+
+
+@app.post("/api/auth/signup")
+def auth_signup():
+    body = request.get_json(silent=True) or {}
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
+    client_ip = body.get("ip") or request.headers.get("X-Forwarded-For", request.remote_addr or "")
+
+    if not _EMAIL_RE.match(email):
+        raise ApiError(400, "メールアドレスの形式が正しくありません")
+    if len(password) < 8:
+        raise ApiError(400, "パスワードは8文字以上にしてください")
+
+    users = _load_users()
+    if email in users:
+        raise ApiError(409, "このメールアドレスは既に登録されています")
+
+    users[email] = {
+        "password_hash": werkzeug.security.generate_password_hash(password),
+        "created_at": time.time(),
+        "signup_ip": client_ip,
+        "last_login_ip": client_ip,
+        "last_login_at": time.time(),
+    }
+    _save_users(users)
+    print(f"[auth] signup: {email} from {client_ip}")
+
+    token = _create_session_token(email)
+    return jsonify({"email": email, "token": token, "max_age": SESSION_MAX_AGE})
+
+
+@app.post("/api/auth/login")
+def auth_login():
+    body = request.get_json(silent=True) or {}
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
+    client_ip = body.get("ip") or request.headers.get("X-Forwarded-For", request.remote_addr or "")
+
+    users = _load_users()
+    user = users.get(email)
+    if not user or not werkzeug.security.check_password_hash(user["password_hash"], password):
+        print(f"[auth] login failed: {email} from {client_ip}")
+        raise ApiError(401, "メールアドレスまたはパスワードが違います")
+
+    user["last_login_ip"] = client_ip
+    user["last_login_at"] = time.time()
+    _save_users(users)
+    print(f"[auth] login ok: {email} from {client_ip}")
+
+    token = _create_session_token(email)
+    return jsonify({"email": email, "token": token, "max_age": SESSION_MAX_AGE})
+
+
+@app.post("/api/auth/verify")
+def auth_verify():
+    body = request.get_json(silent=True) or {}
+    email = _verify_session_token(body.get("token"))
+    if not email:
+        raise ApiError(401, "セッションが無効か期限切れです")
+    return jsonify({"email": email})
 
 
 def _get_local_trending(limit):
@@ -418,13 +522,42 @@ class _PageResponse:
         self.text = text
 
 
+_CHROME_VERSION = "126.0.6478.127"
 _PAGE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        f"(KHTML, like Gecko) Chrome/{_CHROME_VERSION.split('.')[0]}.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+    # 本物のChromeが送ってくるClient Hints/Sec-Fetch系ヘッダー。
+    # これが無いとBotスコアリングで不利になることがあるため一通り揃えている。
+    "Sec-Ch-Ua": f'"Not/A)Brand";v="8", "Chromium";v="{_CHROME_VERSION.split(".")[0]}", "Google Chrome";v="{_CHROME_VERSION.split(".")[0]}"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
 }
+
+
+def _decompress_body(raw, content_encoding):
+    """Accept-Encodingでgzip/deflateを許可した都合上、レスポンスが圧縮されて
+    返ってくることがある。urllibはrequestsと違って自動展開してくれないので、
+    Content-Encodingを見て自前で展開する。"""
+    encoding = (content_encoding or "").lower()
+    try:
+        if "gzip" in encoding:
+            return gzip.decompress(raw)
+        if "deflate" in encoding:
+            return zlib.decompress(raw)
+    except (OSError, zlib.error):
+        return raw
+    return raw
 
 
 def _fetch_page(url, timeout=60):
@@ -437,15 +570,19 @@ def _fetch_page(url, timeout=60):
     headers = dict(_PAGE_HEADERS)
     headers["Cookie"] = _cookie_header_string()
     req = urllib.request.Request(url, headers=headers)
+    content_encoding = ""
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = resp.getcode()
             raw = resp.read()
+            content_encoding = resp.headers.get("Content-Encoding", "")
     except urllib.error.HTTPError as e:
         status = e.code
         raw = e.read() if e.fp else b""
+        content_encoding = e.headers.get("Content-Encoding", "") if e.headers else ""
     except urllib.error.URLError as e:
         raise ApiError(502, f"failed to fetch page: {e.reason}")
+    raw = _decompress_body(raw, content_encoding)
     return _PageResponse(status, raw.decode("utf-8", errors="replace"))
 
 
@@ -459,6 +596,15 @@ def _ydl_opts(extra=None):
         "extractor_args": {"youtube": {"lang": ["ja"]}},
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
+        # yt-dlp自体のリクエストにも、本物のChromeに近いヘッダーを持たせておく
+        # (yt-dlpは内部でgzip/br展開を自前で処理してくれるので、ここはAccept-Encodingを
+        # 含めても安全)。
+        "http_headers": {
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+            "Sec-Ch-Ua": _PAGE_HEADERS["Sec-Ch-Ua"],
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+        },
     }
     if os.path.isfile(COOKIES_FILE_PATH):
         opts["cookiefile"] = COOKIES_FILE_PATH
@@ -514,6 +660,12 @@ def _extract_flat(url, playliststart=None, playlistend=None):
         "extractor_args": {"youtube": {"lang": ["ja"]}},
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
+        "http_headers": {
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+            "Sec-Ch-Ua": _PAGE_HEADERS["Sec-Ch-Ua"],
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+        },
     }
     if os.path.isfile(COOKIES_FILE_PATH):
         opts["cookiefile"] = COOKIES_FILE_PATH
@@ -1183,6 +1335,7 @@ def channel(channel_id):
 
         avatar_url = None
         banner_url = None
+        available_tabs = None
         page_html = None
         try:
             page_resp = _fetch_page(_add_lang_params(url), timeout=10)
@@ -1200,6 +1353,7 @@ def channel(channel_id):
                 if not avatar_url:
                     avatar_url = _find_named_image_url(yt_data, "avatar")
                 banner_url = _find_named_image_url(yt_data, "banner")
+                available_tabs = _find_available_channel_tabs(yt_data) or None
 
         if not avatar_url:
             thumbs = info.get("thumbnails") or []
@@ -1228,6 +1382,10 @@ def channel(channel_id):
         "webpage_url": info.get("webpage_url"),
         "avatar": avatar_url,
         "avatar_base64": avatar_b64,
+        # そのチャンネルに実際に存在するタブだけを返す(空のタブをUIに出さないため)。
+        # 取得できなかった場合はNoneにして、フロント側は「全部あるものとして表示」に
+        # フォールバックできるようにしておく。
+        "available_tabs": available_tabs,
         "banner": banner_url,
         "banner_base64": banner_b64,
         "tab": tab,
@@ -1528,6 +1686,34 @@ def _find_thumbnails_under(node):
             if found:
                 return found
     return None
+
+
+_TAB_URL_TO_KEY = {
+    "videos": "videos",
+    "streams": "streams",
+    "shorts": "shorts",
+    "playlists": "playlists",
+}
+
+
+def _find_available_channel_tabs(yt_data):
+    """
+    チャンネルページのytInitialDataから、実際に存在するタブ(動画/ショート/ライブ/
+    再生リスト等)だけを拾う。YouTube側はそのチャンネルが使っていないタブ
+    (ショート投稿が無い等)をそもそもtabRendererに含めてこないので、
+    これを見れば「空だから隠すべきタブ」が分かる。
+    """
+    found = []
+    for node in _walk(yt_data):
+        if "tabRenderer" not in node:
+            continue
+        tab = node["tabRenderer"]
+        url = _dig(tab, "endpoint", "commandMetadata", "webCommandMetadata", "url") or ""
+        segment = url.rstrip("/").rsplit("/", 1)[-1] if url else ""
+        key = _TAB_URL_TO_KEY.get(segment)
+        if key and key not in found:
+            found.append(key)
+    return found
 
 
 def _find_channel_metadata_avatar(yt_data):
