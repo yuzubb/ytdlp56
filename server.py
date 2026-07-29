@@ -46,6 +46,8 @@ cookies.txtについて:
 """
 
 import os
+import string
+import secrets
 import re
 import json
 import time
@@ -104,14 +106,69 @@ def _cookie_header_string():
 # /api/info, /api/stream の結果を保存する期間
 RESPONSE_CACHE_TTL_SECONDS = int(os.environ.get("YTDLP_API_CACHE_TTL_SECONDS", str(7 * 3600)))  # 7時間
 
-# キャッシュ削除など破壊的な操作を保護するパスワード。未設定だと誰でも削除できてしまうので、
-# 未設定の場合は削除系エンドポイントを常に拒否する(空文字列だと事故で誰でも通ってしまうため)。
-ADMIN_PASSWORD = os.environ.get("YTDLP_API_ADMIN_PASSWORD", "")
+
+def _get_or_create_secret(env_var_name, file_name, length=48):
+    """
+    環境変数で指定されていればそれを使う。無ければ、英数字のランダムな長い文字列を
+    自動生成してファイルに保存し、次回起動時もその値を使い続ける(毎回変わると
+    フロントエンド側の設定と食い違ってしまうため)。
+    """
+    from_env = os.environ.get(env_var_name, "")
+    if from_env:
+        return from_env
+
+    secret_path = os.path.join(TMP_DIR_PATH, file_name)
+    if os.path.isfile(secret_path):
+        with open(secret_path, "r", encoding="utf-8") as f:
+            saved = f.read().strip()
+            if saved:
+                return saved
+
+    alphabet = string.ascii_letters + string.digits
+    generated = "".join(secrets.choice(alphabet) for _ in range(length))
+    with open(secret_path, "w", encoding="utf-8") as f:
+        f.write(generated)
+    print(f"[security] {env_var_name} が未設定だったため、ランダムな値を自動生成しました。")
+    print(f"[security] 値は {secret_path} に保存済みです: {generated}")
+    return generated
+
+
+# キャッシュ削除など破壊的な操作を保護するパスワード。未設定なら長いランダム文字列を自動生成する。
+ADMIN_PASSWORD = _get_or_create_secret("YTDLP_API_ADMIN_PASSWORD", "admin_password.txt")
+
+# フロントエンドとバックエンドだけが知っている合言葉。/api/* へのアクセスはこれが
+# 一致しないと弾かれるので、URLを知っているだけの第三者が直接APIを叩けないようにする。
+API_SHARED_SECRET = _get_or_create_secret("YTDLP_API_SHARED_SECRET", "shared_secret.txt")
+
+# API_SHARED_SECRETのチェックを免除するパス。
+# /api/stats(ダッシュボード)は人間が直接ブラウザで開く監視用ページなので対象外にする。
+_SECRET_EXEMPT_PATHS = {"/api/health", "/api/stats", "/api/stats/data"}
+
+
+@app.before_request
+def _enforce_shared_secret():
+    """
+    フロントエンド以外からの直接アクセスを防ぐための門番。/api/ 配下は全部、
+    正しい合言葉(X-Internal-Secretヘッダ)を持っていないと弾く。
+    """
+    path = request.path
+    if not path.startswith("/api/"):
+        return None
+
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "")
+    if path not in _SECRET_EXEMPT_PATHS:
+        print(f"[access] {client_ip} -> {request.method} {path}")
+
+    if path in _SECRET_EXEMPT_PATHS:
+        return None
+    supplied = request.headers.get("X-Internal-Secret", "")
+    if supplied != API_SHARED_SECRET:
+        print(f"[security] forbidden access attempt from {client_ip}: {request.method} {path}")
+        return jsonify({"detail": "forbidden"}), 403
+    return None
 
 
 def _require_admin_password():
-    if not ADMIN_PASSWORD:
-        raise ApiError(503, "admin password is not configured on the server (set YTDLP_API_ADMIN_PASSWORD)")
     supplied = request.args.get("password", "")
     if supplied != ADMIN_PASSWORD:
         raise ApiError(403, "invalid password")
@@ -154,6 +211,10 @@ def _record_view(video_id, data):
         entry["title"] = data.get("title") or entry.get("title")
         entry["channel"] = data.get("channel") or data.get("uploader") or entry.get("channel")
         entry["channel_id"] = data.get("channel_id") or entry.get("channel_id")
+        # base64版を優先して保存(ホットリンク切れの心配がないため)
+        entry["channel_thumbnail"] = (
+            data.get("channel_avatar_base64") or data.get("channel_avatar") or entry.get("channel_thumbnail")
+        )
         entry["thumbnail"] = data.get("thumbnail") or entry.get("thumbnail")
         entry["duration"] = data.get("duration") or entry.get("duration")
         entry["last_viewed"] = time.time()
@@ -172,7 +233,7 @@ def _get_local_trending(limit):
             "title": entry.get("title"),
             "channel": entry.get("channel"),
             "channel_id": entry.get("channel_id"),
-            "channel_thumbnail": None,
+            "channel_thumbnail": entry.get("channel_thumbnail"),
             "thumbnail": entry.get("thumbnail"),
             "duration": entry.get("duration"),
             "view_count_text": f"このサイトで{entry.get('view_count', 0)}回視聴",
@@ -402,7 +463,7 @@ _PAGE_HEADERS = {
 }
 
 
-def _fetch_page(url, timeout=15):
+def _fetch_page(url, timeout=60):
     """
     YouTubeの生HTMLページを取ってくる。requestsではなくPython標準ライブラリ(urllib)を
     使っている。requests(urllib3)だとブロックされるケースでも、urllibだとTLS/HTTPの
@@ -606,9 +667,35 @@ _API_DOCS_HTML = """<!doctype html>
   <h1>ytdlp_api</h1>
   <div class="sub">yt-dlp powered API (no UI, docs only) &middot; <a href="/api/stats">/api/stats ダッシュボードはこちら</a></div>
 
+  <div class="card">
+    <div class="desc">
+      /api/health, /api/stats を除く全エンドポイントは合言葉(X-Internal-Secret)が
+      一致しないと弾かれます。サーバー起動時のログ、または保存された shared_secret.txt を
+      確認して、ここに貼っておいてください(このブラウザだけに保存されます)。
+    </div>
+    <div class="params">
+      <label>合言葉(X-Internal-Secret)
+        <input type="password" id="apiSecretInput" placeholder="shared_secret.txtの中身">
+      </label>
+    </div>
+    <button class="run" id="apiSecretSaveBtn">保存</button>
+  </div>
+
   <div id="cards"></div>
 
 <script>
+const API_SECRET_STORAGE_KEY = "ytdlp_api_docs_secret";
+
+function apiSecretHeaders() {
+  const secret = localStorage.getItem(API_SECRET_STORAGE_KEY) || "";
+  return secret ? { "X-Internal-Secret": secret } : {};
+}
+
+document.getElementById("apiSecretInput").value = localStorage.getItem(API_SECRET_STORAGE_KEY) || "";
+document.getElementById("apiSecretSaveBtn").addEventListener("click", () => {
+  localStorage.setItem(API_SECRET_STORAGE_KEY, document.getElementById("apiSecretInput").value.trim());
+});
+
 const ENDPOINTS = [
   { method: "GET", path: "/api/health", desc: "死活監視", params: [] },
   { method: "GET", path: "/api/search", desc: "YouTube検索(flat抽出で高速)。",
@@ -723,7 +810,7 @@ function buildCard(ep, index) {
 
     const startedAt = performance.now();
     try {
-      const res = await fetch(url, { method: ep.method });
+      const res = await fetch(url, { method: ep.method, headers: apiSecretHeaders() });
       const elapsed = Math.round(performance.now() - startedAt);
       const text = await res.text();
       let pretty = text;
@@ -1030,7 +1117,7 @@ def search():
     with _track_processing(f"search:{q}", "search"):
         search_url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(q)
         try:
-            resp = _fetch_page(_add_lang_params(search_url), timeout=15)
+            resp = _fetch_page(_add_lang_params(search_url), timeout=60)
             if resp.status_code < 400:
                 yt_data = _extract_yt_initial_data(resp.text)
                 if yt_data:
@@ -1193,6 +1280,37 @@ def channel(channel_id):
     return jsonify(result)
 
 
+@app.get("/api/subtitles/<video_id>")
+def subtitles(video_id):
+    """
+    指定言語の字幕をWebVTT形式で返す。?auto=1で自動生成字幕、既定(0)は手動字幕。
+    利用可能な言語コードの一覧は /api/info の subtitles_languages /
+    automatic_captions_languages で確認できる。
+    """
+    lang = request.args.get("lang", "ja")
+    auto = request.args.get("auto", "0") == "1"
+
+    with _track_processing(video_id, "subtitles"):
+        data = _extract_full(video_id)
+
+    pool = data.get("automatic_captions" if auto else "subtitles") or {}
+    tracks = pool.get(lang)
+    if not tracks:
+        kind = "自動生成" if auto else "手動"
+        raise ApiError(404, f"{kind}字幕が見つかりません (lang={lang})")
+
+    track = next((t for t in tracks if t.get("ext") == "vtt"), tracks[0])
+    sub_url = track.get("url")
+    if not sub_url:
+        raise ApiError(404, "subtitle url not found")
+
+    resp = _fetch_page(sub_url, timeout=60)
+    if resp.status_code >= 400:
+        raise ApiError(502, f"failed to fetch subtitle: HTTP {resp.status_code}")
+
+    return Response(resp.text, mimetype="text/vtt")
+
+
 @app.get("/api/comments/<video_id>")
 def comments(video_id):
     """動画のコメント一覧を取得する(yt-dlpのgetcomments機能)。件数が多いと時間がかかる。"""
@@ -1271,7 +1389,7 @@ def livechat(video_id):
         if not chat_url:
             raise ApiError(404, "live chat url not found")
 
-        resp = _fetch_page(chat_url, timeout=15)
+        resp = _fetch_page(chat_url, timeout=60)
         if resp.status_code >= 400:
             raise ApiError(502, f"failed to fetch live chat data: HTTP {resp.status_code}")
 
@@ -1641,7 +1759,7 @@ def related(video_id):
 
     watch_url = _resolve_url(video_id)
     with _track_processing(video_id, "related"):
-        resp = _fetch_page(_add_lang_params(watch_url), timeout=15)
+        resp = _fetch_page(_add_lang_params(watch_url), timeout=60)
         if resp.status_code >= 400:
             raise ApiError(502, f"watch page returned HTTP {resp.status_code}")
         yt_data = _extract_yt_initial_data(resp.text)
@@ -1898,6 +2016,15 @@ def proxy_stream(video_id):
             passthrough_headers[h] = upstream.headers[h]
     passthrough_headers.setdefault("Accept-Ranges", "bytes")
     passthrough_headers.setdefault("Content-Type", "video/mp4")
+
+    if request.args.get("download", "0") == "1":
+        ext = "mp4"
+        content_type = passthrough_headers.get("Content-Type", "")
+        if "webm" in content_type:
+            ext = "webm"
+        elif "audio" in content_type:
+            ext = "m4a"
+        passthrough_headers["Content-Disposition"] = f'attachment; filename="{video_id}_{format_id}.{ext}"'
 
     def gen():
         try:
