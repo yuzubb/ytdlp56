@@ -49,6 +49,7 @@ import os
 import string
 import secrets
 import re
+import html as html_module
 import json
 import time
 import base64
@@ -70,9 +71,6 @@ app = Flask(__name__)
 TMP_DIR_PATH = os.environ.get("YTDLP_API_TMP", os.path.join(os.path.expanduser("~"), "ytdlp_api_tmp"))
 os.makedirs(TMP_DIR_PATH, exist_ok=True)
 
-# cookies.txt (Netscape形式)。年齢制限/メンバー限定動画へのアクセスや、
-# Bot判定の回避に使う。既定ではserver.pyと同じディレクトリに置くだけで拾われる。
-# 無ければ何もしない(これまで通りcookie無しで動く)。
 COOKIES_FILE_PATH = os.environ.get(
     "YTDLP_API_COOKIES_FILE",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt"),
@@ -103,8 +101,7 @@ def _cookie_header_string():
     return "; ".join(parts)
 
 
-# /api/info, /api/stream の結果を保存する期間
-RESPONSE_CACHE_TTL_SECONDS = int(os.environ.get("YTDLP_API_CACHE_TTL_SECONDS", str(7 * 3600)))  # 7時間
+RESPONSE_CACHE_TTL_SECONDS = int(os.environ.get("YTDLP_API_CACHE_TTL_SECONDS", str(7 * 3600)))
 
 
 def _get_or_create_secret(env_var_name, file_name, length=48):
@@ -133,15 +130,10 @@ def _get_or_create_secret(env_var_name, file_name, length=48):
     return generated
 
 
-# キャッシュ削除など破壊的な操作を保護するパスワード。未設定なら長いランダム文字列を自動生成する。
 ADMIN_PASSWORD = _get_or_create_secret("YTDLP_API_ADMIN_PASSWORD", "admin_password.txt")
 
-# フロントエンドとバックエンドだけが知っている合言葉。/api/* へのアクセスはこれが
-# 一致しないと弾かれるので、URLを知っているだけの第三者が直接APIを叩けないようにする。
 API_SHARED_SECRET = _get_or_create_secret("YTDLP_API_SHARED_SECRET", "shared_secret.txt")
 
-# API_SHARED_SECRETのチェックを免除するパス。
-# /api/stats(ダッシュボード)は人間が直接ブラウザで開く監視用ページなので対象外にする。
 _SECRET_EXEMPT_PATHS = {"/api/health", "/api/stats", "/api/stats/data"}
 
 
@@ -174,15 +166,10 @@ def _require_admin_password():
         raise ApiError(403, "invalid password")
 
 
-# ---------- 自前トレンド (このサーバー経由で実際に視聴された動画の集計) ----------
-#
-# YouTube公式のトレンドページのスクレイピングはBot対策等で不安定だったため、
-# 代わりに「このAPI経由で/api/infoが叩かれた回数」を自前で集計してトレンドとして使う。
-# .jsonファイルに素朴に貯めていくだけの、種類別に分けたシンプルな構成。
 
 TRENDING_DATA_DIR = os.path.join(TMP_DIR_PATH, "trending_data")
 os.makedirs(TRENDING_DATA_DIR, exist_ok=True)
-VIEWS_JSON_PATH = os.path.join(TRENDING_DATA_DIR, "views.json")  # video_id -> 視聴統計
+VIEWS_JSON_PATH = os.path.join(TRENDING_DATA_DIR, "views.json")
 _TRENDING_LOCK = threading.Lock()
 
 
@@ -195,7 +182,6 @@ def _load_json_file(path):
 
 
 def _save_json_file(path, data):
-    # 書き込み中にプロセスが落ちてファイルが壊れないよう、一時ファイルに書いてから置き換える
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
@@ -211,7 +197,6 @@ def _record_view(video_id, data):
         entry["title"] = data.get("title") or entry.get("title")
         entry["channel"] = data.get("channel") or data.get("uploader") or entry.get("channel")
         entry["channel_id"] = data.get("channel_id") or entry.get("channel_id")
-        # base64版を優先して保存(ホットリンク切れの心配がないため)
         entry["channel_thumbnail"] = (
             data.get("channel_avatar_base64") or data.get("channel_avatar") or entry.get("channel_thumbnail")
         )
@@ -243,18 +228,15 @@ def _get_local_trending(limit):
     return entries
 
 
-# /api/proxy-stream が使う、フォーマットごとのCDN直リンクの短時間キャッシュ
 _STREAM_URL_CACHE = {}
-STREAM_URL_CACHE_TTL_SEC = int(os.environ.get("YTDLP_API_STREAM_URLCACHE_TTL", "1800"))  # 30分
+STREAM_URL_CACHE_TTL_SEC = int(os.environ.get("YTDLP_API_STREAM_URLCACHE_TTL", "1800"))
 
-# ---------- worker / 稼働状況 ----------
 
 SERVER_ID = os.environ.get("YTDLP_API_SERVER_ID", "1")
 SERVER_NAME = os.environ.get("YTDLP_API_SERVER_NAME", f"Server {SERVER_ID}")
-SERVER_ROLE = os.environ.get("YTDLP_API_ROLE", "primary")  # 複数台構成なら secondary 等を指定
+SERVER_ROLE = os.environ.get("YTDLP_API_ROLE", "primary")
 START_TIME = time.time()
 
-# 現在処理中のジョブ: video_id -> {"worker":..., "type":..., "started_at": epoch秒}
 _ACTIVE_JOBS = {}
 _ACTIVE_JOBS_LOCK = threading.Lock()
 
@@ -286,7 +268,6 @@ def _format_uptime(seconds):
     return f"{h}時間{m}分{s}秒"
 
 
-# ---------- 永続DB (SQLite): 一覧用インデックス + レスポンスキャッシュ ----------
 
 CACHE_DB_PATH = os.path.join(TMP_DIR_PATH, "cache.db")
 _CACHE_DB_LOCK = threading.Lock()
@@ -389,12 +370,10 @@ def _response_cache_set(key, kind, video_id, payload):
                 payload=excluded.payload,
                 created_at=excluded.created_at
         """, (key, kind, video_id, json.dumps(payload, ensure_ascii=False), now))
-        # ついでに期限切れの古いキャッシュも掃除しておく
         threshold = now - RESPONSE_CACHE_TTL_SECONDS
         conn.execute("DELETE FROM response_cache WHERE created_at < ?", (threshold,))
 
 
-# ---------- 共通ヘルパー ----------
 
 def _resolve_url(video_id):
     """video_idがURLならデコードしてそのまま使い、そうでなければYouTube動画とみなす。"""
@@ -492,29 +471,14 @@ def _ydl_opts(extra=None):
         "noplaylist": True,
         "skip_download": True,
         "nocheckcertificate": True,
-        # YouTubeは視聴環境の言語設定によっては、オリジナルが日本語のタイトルでも
-        # 自動翻訳された英語タイトルを返してくることがある。明示的にjaを指定して抑える。
-        #
-        # player_clientはあえて指定していない。以前はPO Token方式のためmweb/webに
-        # 固定していたが、PO Token用のサーバー(bgutil)を常時起動し続けるのが
-        # 運用上つらかったため、cookies.txtによる認証に一本化した。
-        # ログイン済みcookieがあれば、yt-dlp標準のクライアント選択で
-        # 通常問題なくフォーマット一覧が取得できる。
         "extractor_args": {"youtube": {"lang": ["ja"]}},
-        # 2025年後半以降、署名解読(nシグネチャ等)に外部JSランタイムが事実上必須になった。
-        # Termuxにはdeno(既定ランタイム)が無いのでnodeを明示的に有効化する。
-        # (これはcookies.txt方式でも引き続き必要)
         "js_runtimes": {"node": {}},
-        # 署名解読スクリプト本体(EJS)をGitHubから取得することを許可する設定。
-        # これが無いと "Signature solving failed" で一部/全部のフォーマットが欠落する。
         "remote_components": ["ejs:github"],
     }
     if os.path.isfile(COOKIES_FILE_PATH):
         opts["cookiefile"] = COOKIES_FILE_PATH
     if extra:
         extra = dict(extra)
-        # extractor_argsは単純にdict.updateすると丸ごと上書きされてlang指定が
-        # 消えてしまうので(例: コメント取得時のmax_comments指定)、ここだけ個別にマージする。
         extra_extractor_args = extra.pop("extractor_args", None)
         opts.update(extra)
         if extra_extractor_args:
@@ -598,14 +562,12 @@ def _slim_entry(e):
 
 
 
-# ---------- health ----------
 
 @app.get("/api/health")
 def health():
     return jsonify({"status": "ok", "uptime_seconds": _uptime_seconds()})
 
 
-# ---------- /api (一覧・説明・実行テストページ) ----------
 
 _API_DOCS_HTML = """<!doctype html>
 <html lang="ja">
@@ -844,7 +806,6 @@ def api_docs():
     return Response(_API_DOCS_HTML, mimetype="text/html")
 
 
-# ---------- workers / 処理中 / stats ----------
 
 def _workers_snapshot():
     with _ACTIVE_JOBS_LOCK:
@@ -1003,7 +964,6 @@ def stats_page():
     return Response(_STATS_HTML, mimetype="text/html")
 
 
-# ---------- cache (これまでに解決した動画の一覧インデックス) ----------
 
 @app.get("/api/cache")
 def cache_list():
@@ -1082,7 +1042,6 @@ def cache_delete_all():
         response_count = conn.execute("SELECT COUNT(*) AS c FROM response_cache").fetchone()["c"]
         conn.execute("DELETE FROM cache")
         conn.execute("DELETE FROM response_cache")
-    # 短時間キャッシュ(URL解決結果)もついでに消しておく
     _STREAM_URL_CACHE.clear()
     return jsonify({
         "deleted": "all",
@@ -1091,49 +1050,81 @@ def cache_delete_all():
     })
 
 
-# ---------- search / playlist / channel / comments / related ----------
 
 @app.get("/api/search")
 def search():
     """
-    ?q=検索語 でYouTube検索。
+    ?q=検索語 でYouTube検索。?continuation=続きのトークン で次のページを取得できる
+    (無限スクロール用)。レスポンスの next_continuation を次回のリクエストに渡せばよい。
+    ?sp= でYouTube本家の検索フィルター(アップロード日/動画の長さ/並び替え/種類)を指定できる。
+    有効な値は _SEARCH_FILTER_VALUES を参照(未知の値は無視される)。
 
     まずYouTubeの検索結果ページを直接スクレイピングする(related/trendingと同じ
     「動画カードを総当たりで拾う」方式)。こちらだと各結果にチャンネルの小さい
     アイコン画像(channel_thumbnail)も付いてくる。yt-dlpのflat検索(ytsearchN:)には
-    このアイコン情報が無いため、フォールバック用にとどめている。
+    このアイコン情報が無いため、フォールバック用にとどめている
+    (ただしyt-dlpフォールバック時は続きのページ取得・フィルターは使えない)。
     """
     q = request.args.get("q")
     if not q:
         raise ApiError(400, "query parameter 'q' is required")
     limit = max(1, min(int(request.args.get("limit", 20)), 50))
+    continuation_token = request.args.get("continuation")
+    sp = request.args.get("sp", "")
+    if sp not in _SEARCH_FILTER_VALUES:
+        sp = ""
 
-    key = f"search:{q}:{limit}"
+    def _build_search_url():
+        url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(q)
+        if sp:
+            url += "&sp=" + urllib.parse.quote(sp)
+        return url
+
+    if continuation_token:
+        with _track_processing(f"search:{q}", "search"):
+            resp = _fetch_page(_add_lang_params(_build_search_url()), timeout=60)
+            api_key, context = _extract_ytcfg(resp.text)
+            if not api_key or not context:
+                raise ApiError(502, "failed to resolve continuation context")
+            cont_data = _fetch_youtube_continuation("search", api_key, context, continuation_token)
+            entries = _parse_video_cards(cont_data, None, limit)
+            next_token = _find_continuation_token(cont_data)
+
+        return jsonify(_json_safe({
+            "query": q,
+            "result_count": len(entries),
+            "entries": entries,
+            "next_continuation": next_token,
+        }))
+
+    key = f"search:{q}:{limit}:{sp}"
     cached = _response_cache_get(key)
     if cached is not None:
         return jsonify(cached)
 
     entries = None
+    next_token = None
     with _track_processing(f"search:{q}", "search"):
-        search_url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(q)
         try:
-            resp = _fetch_page(_add_lang_params(search_url), timeout=60)
+            resp = _fetch_page(_add_lang_params(_build_search_url()), timeout=60)
             if resp.status_code < 400:
                 yt_data = _extract_yt_initial_data(resp.text)
                 if yt_data:
                     entries = _parse_video_cards(yt_data, None, limit)
+                    next_token = _find_continuation_token(yt_data)
         except ApiError:
             pass
 
         if not entries:
-            # スクレイピングがダメだった場合のフォールバック(チャンネルアイコンは付かない)
             info = _extract_flat(f"ytsearch{limit}:{q}")
             entries = [_slim_entry(e) for e in (info.get("entries") or [])]
+            next_token = None
 
     result = _json_safe({
         "query": q,
         "result_count": len(entries),
         "entries": entries,
+        "next_continuation": next_token,
         "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
     })
     _response_cache_set(key, "search", q, result)
@@ -1145,7 +1136,13 @@ def search():
 
 @app.get("/api/playlist/<playlist_id>")
 def playlist(playlist_id):
-    """プレイリストのメタ情報+収録動画一覧(flat抽出)。?limit=&offset=で範囲指定。"""
+    """プレイリストのメタ情報+収録動画一覧。?limit=&offset=で範囲指定。
+    まずプレイリストページを直接スクレイピングする(search/relatedと同じ方式)。
+    こちらだと動画ごとに投稿チャンネルの小さいアイコン画像(channel_thumbnail)も
+    付いてくる(プレイリストの収録動画は投稿者がバラバラなことがあるため、
+    チャンネルページの時のように1つのアバターを使い回すことができない)。
+    失敗した場合のみyt-dlpのflat抽出にフォールバックする。
+    """
     limit = max(1, min(int(request.args.get("limit", 100)), 500))
     offset = max(0, int(request.args.get("offset", 0)))
 
@@ -1155,18 +1152,38 @@ def playlist(playlist_id):
         return jsonify(cached)
 
     url = _resolve_playlist_url(playlist_id)
+    entries = None
+    title = None
+    uploader = None
+    channel_id = None
     with _track_processing(playlist_id, "playlist"):
-        info = _extract_flat(url, playliststart=offset + 1, playlistend=offset + limit)
+        try:
+            resp = _fetch_page(_add_lang_params(url), timeout=60)
+            if resp.status_code < 400:
+                yt_data = _extract_yt_initial_data(resp.text)
+                if yt_data:
+                    all_cards = _parse_video_cards(yt_data, None, offset + limit)
+                    entries = all_cards[offset:offset + limit]
+                    title = _extract_og_title(resp.text)
+        except ApiError:
+            pass
 
-    entries = [_slim_entry(e) for e in (info.get("entries") or [])]
+        info = None
+        if not entries:
+            info = _extract_flat(url, playliststart=offset + 1, playlistend=offset + limit)
+            entries = [_slim_entry(e) for e in (info.get("entries") or [])]
+            title = info.get("title") or title
+            uploader = info.get("uploader") or info.get("channel")
+            channel_id = info.get("channel_id") or info.get("uploader_id")
+
     result = _json_safe({
-        "playlist_id": info.get("id") or playlist_id,
-        "title": info.get("title"),
-        "uploader": info.get("uploader") or info.get("channel"),
-        "channel_id": info.get("channel_id") or info.get("uploader_id"),
-        "webpage_url": info.get("webpage_url"),
-        "description": info.get("description"),
-        "entry_count_total": info.get("playlist_count"),
+        "playlist_id": (info.get("id") if info else None) or playlist_id,
+        "title": title,
+        "uploader": uploader,
+        "channel_id": channel_id,
+        "webpage_url": url,
+        "description": info.get("description") if info else None,
+        "entry_count_total": (info.get("playlist_count") if info else None),
         "entry_count_returned": len(entries),
         "entries": entries,
         "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
@@ -1224,19 +1241,16 @@ def channel(channel_id):
             pass
 
         if page_html:
-            # og:imageメタタグが一番単純で壊れにくいので最優先で使う
             avatar_url = _extract_og_image(page_html)
             yt_data = _extract_yt_initial_data(page_html)
             if yt_data:
                 if not avatar_url:
-                    # channelMetadataRendererを狙い撃ち(汎用の"avatar"総当たりより確実)
                     avatar_url = _find_channel_metadata_avatar(yt_data)
                 if not avatar_url:
                     avatar_url = _find_named_image_url(yt_data, "avatar")
                 banner_url = _find_named_image_url(yt_data, "banner")
 
         if not avatar_url:
-            # それでもダメならyt-dlp側のthumbnailsにフォールバック
             thumbs = info.get("thumbnails") or []
             if thumbs:
                 avatar_url = thumbs[-1].get("url")
@@ -1250,8 +1264,6 @@ def channel(channel_id):
     entries = []
     for e in (info.get("entries") or []):
         slim = _slim_entry(e)
-        # このページの動画は全部同じチャンネルのものなので、名前/アイコンが
-        # 個別に取れていなければチャンネル側の情報で埋める。
         slim["channel"] = slim.get("channel") or channel_name
         slim["channel_id"] = slim.get("channel_id") or (info.get("channel_id") or channel_id)
         slim["channel_thumbnail"] = avatar_for_entries
@@ -1393,7 +1405,6 @@ def livechat(video_id):
         if resp.status_code >= 400:
             raise ApiError(502, f"failed to fetch live chat data: HTTP {resp.status_code}")
 
-    # ライブチャットのレスポンスは1行1JSONのことが多いので、行ごとにパースを試す
     messages = []
     for line in resp.text.splitlines():
         line = line.strip()
@@ -1437,9 +1448,6 @@ def livechat(video_id):
 
 
 def _find_balanced_json(text, start_idx):
-    # start_idxの '{' から対応する '}' までを文字列として切り出すだけの地味な関数。
-    # 中に文字列リテラルが混ざってるとナイーブな正規表現だと簡単に壊れるので、
-    # ちゃんと文字列/エスケープを見ながら深さを数える。
     depth = 0
     in_string = False
     escape = False
@@ -1467,11 +1475,45 @@ def _find_balanced_json(text, start_idx):
     return None
 
 
+def _extract_ytcfg(html):
+    m = re.search(r"ytcfg\.set\(\s*(\{.+?\})\s*\)\s*;", html)
+    if not m:
+        return None, None
+    try:
+        cfg = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None, None
+    return cfg.get("INNERTUBE_API_KEY"), cfg.get("INNERTUBE_CONTEXT")
+
+
+def _find_continuation_token(yt_data):
+    for node in _walk(yt_data):
+        if "continuationItemRenderer" in node:
+            token = _dig(node, "continuationItemRenderer", "continuationEndpoint", "continuationCommand", "token")
+            if token:
+                return token
+    return None
+
+
+def _fetch_youtube_continuation(endpoint, api_key, context, continuation_token, timeout=60):
+    """
+    検索結果・チャンネル動画一覧の「続き」を取得する。YouTubeの内部API
+    (youtubei)を直接叩く。endpointは "search" か "browse"。
+    """
+    url = f"https://www.youtube.com/youtubei/v1/{endpoint}?key={api_key}"
+    body = json.dumps({"context": context, "continuation": continuation_token}).encode("utf-8")
+    headers = dict(_PAGE_HEADERS)
+    headers["Content-Type"] = "application/json"
+    headers["Cookie"] = _cookie_header_string()
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError) as e:
+        raise ApiError(502, f"failed to fetch continuation: {e}")
+
+
 def _extract_yt_initial_data(html):
-    # 動画ページのソースには <script>var ytInitialData = {...};</script> みたいな形で
-    # ページの中身が丸ごとJSONで埋まってる。そこを引っこ抜くだけ。
-    # マーカーを何パターンか用意してるのは、YouTubeが時々書き方を変えてくるため
-    # (var付き/なし、ブラケット記法、など)。
     for marker in ("var ytInitialData = ", 'ytInitialData"] = ', "ytInitialData = "):
         idx = html.find(marker)
         if idx == -1:
@@ -1490,8 +1532,6 @@ def _extract_yt_initial_data(html):
 
 
 def _runs_text(node):
-    # YouTubeの内部JSONはテキストが {"simpleText": "..."} だったり
-    # {"runs": [{"text": "a"}, {"text": "b"}]} だったりバラバラなので吸収する。
     if not node:
         return None
     if "simpleText" in node:
@@ -1502,8 +1542,6 @@ def _runs_text(node):
 
 
 def _dig(obj, *path):
-    # ネストしたdict/listを obj["a"]["b"][0]["c"] みたいに辿るやつ。
-    # 途中でキーが無くても例外で落ちずにNoneを返すだけの雑なヘルパー。
     cur = obj
     for key in path:
         try:
@@ -1514,10 +1552,6 @@ def _dig(obj, *path):
 
 
 def _walk(node):
-    # JSONツリー全体を舐めて、出てきたdictを片っ端からyieldする。
-    # 「compactVideoRendererはこの階層のこのキーの下」みたいな決め打ちを
-    # やめて全部潜るようにしておくと、YouTubeが階層をちょっといじった程度では
-    # 壊れなくなる。多少非効率だが動画1本分のJSONくらいなら誤差。
     if isinstance(node, dict):
         yield node
         for v in node.values():
@@ -1528,11 +1562,6 @@ def _walk(node):
 
 
 def _find_thumbnails_under(node):
-    # dictの中のどこかにある "thumbnails": [...] を深さ問わず探して返す。
-    # YouTubeは新しいページ構造(pageHeaderViewModel系)だと同じ役割のキーが
-    # "sources" という名前になっていることがあるので、そちらも見る。
-    # avatar/bannerのJSON構造はチャンネルによって微妙に階層が違うことがあるので、
-    # ピンポイントでパスを決め打ちせずに総当たりする。
     if isinstance(node, dict):
         for key in ("thumbnails", "sources"):
             thumbs = node.get(key)
@@ -1611,6 +1640,21 @@ def _extract_og_image(html):
     return m.group(1) if m else None
 
 
+_OG_TITLE_RE = re.compile(
+    r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE
+)
+_OG_TITLE_RE_ALT = re.compile(
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']', re.IGNORECASE
+)
+
+
+def _extract_og_title(html):
+    m = _OG_TITLE_RE.search(html) or _OG_TITLE_RE_ALT.search(html)
+    if not m:
+        return None
+    return html_module.unescape(m.group(1))
+
+
 def _image_to_data_uri(url):
     """画像URLをサーバー側で取得してbase64のdata URIにして返す(ホットリンク周りの問題を避けるため)。
     取得に失敗したらNoneを返すだけで、呼び出し側は気にせずそのまま使える。"""
@@ -1629,9 +1673,24 @@ def _image_to_data_uri(url):
     return f"data:{content_type};base64,{b64}"
 
 
-# 動画レンダラーからチャンネルIDを拾うための候補パス。
-# レンダラーの種類(compactVideoRenderer / videoRenderer / gridVideoRenderer 等)によって
-# 微妙に構造が違うので、上から順に試して最初に見つかったものを使う。
+# YouTube検索の ?sp= フィルター値。protobufをbase64エンコードした値で、
+# 複数条件を自由に組み合わせるには本来protobufのマージが必要になるため、
+# ここでは動作確認が取れている「単体で使える値」だけをホワイトリストにしている。
+_SEARCH_FILTER_VALUES = {
+    # アップロード日
+    "EgIIAg==": "今日",
+    "EgIIAw==": "今週",
+    # 動画の長さ
+    "EgIYAQ==": "4分未満",
+    "EgIYAg==": "20分以上",
+    # 種類
+    "EgIQAg==": "チャンネル",
+    "EgIQAw==": "再生リスト",
+    # 並び替え
+    "CAI=": "アップロード日順",
+    "CAM=": "視聴回数順",
+}
+
 _CHANNEL_ID_PATHS = (
     ("channelThumbnailSupportedRenderers", "channelThumbnailWithLinkRenderer",
      "navigationEndpoint", "browseEndpoint", "browseId"),
@@ -1639,8 +1698,6 @@ _CHANNEL_ID_PATHS = (
     ("longBylineText", "runs", 0, "navigationEndpoint", "browseEndpoint", "browseId"),
 )
 
-# 検索結果/関連動画/トレンドのカードに、投稿者の小さいアイコン画像が埋まっていることがある。
-# チャンネルIDと同じ場所(channelThumbnailSupportedRenderers)にぶら下がっていることが多い。
 _CHANNEL_THUMBNAIL_PATHS = (
     ("channelThumbnailSupportedRenderers", "channelThumbnailWithLinkRenderer", "thumbnail", "thumbnails"),
     ("channelThumbnail", "thumbnails"),
@@ -1648,11 +1705,6 @@ _CHANNEL_THUMBNAIL_PATHS = (
 
 
 def _looks_like_video(node):
-    # 「これは動画1本を表すレンダラーっぽいか」の判定。
-    # レンダラー名(compactVideoRendererとか)には依存せず、中身の形だけで判断する。
-    # videoIdとtitleは必須、あとthumbnail/lengthText/viewCount系のどれか1つでもあれば
-    # だいたい本物の動画カード。これで検索候補やチャットのメンションなど
-    # videoIdだけ持ってる別種のノイズを弾ける。
     if not isinstance(node, dict):
         return False
     if not node.get("videoId") or not node.get("title"):
@@ -1718,8 +1770,6 @@ def _parse_video_cards(yt_data, exclude_id, limit):
     return entries
 
 
-# watch pageを叩くだけなのに毎回新規コネクション張るのは無駄なので使い回す。
-# ついでにブラウザっぽいヘッダを一式乗せておく(素のrequestsのUAだと弾かれることがある)。
 _http = requests.Session()
 _http.headers.update({
     "User-Agent": (
@@ -1728,13 +1778,9 @@ _http.headers.update({
     ),
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
 })
-# Cookie無しでYouTubeに直接アクセスすると、地域によっては本来のページの代わりに
-# 「続行する前に」のクッキー同意画面が返ってきて中身が空になることがある。
-# この同意済みクッキーを最初から持たせておくことでその画面を回避する。
 _http.cookies.set("CONSENT", "YES+1", domain=".youtube.com")
 _http.cookies.set("SOCS", "CAI", domain=".youtube.com")
 
-# cookies.txtがあれば、こちらのセッション(画像取得等に使う)にも反映しておく。
 _cookiejar_at_startup = _load_cookiejar()
 if _cookiejar_at_startup:
     for _cookie in _cookiejar_at_startup:
@@ -1813,9 +1859,7 @@ def trending():
     }))
 
 
-# ---------- info (ストリームURLは含まない全メタデータ) ----------
 
-# レスポンスから除外するキー(ストリームURLや巨大すぎる/内部利用のフィールド)
 _INFO_BLACKLIST_KEYS = {
     "formats", "requested_formats", "requested_downloads",
     "url", "manifest_url", "http_headers",
@@ -1852,7 +1896,7 @@ def _build_info_payload(data):
     sanitized = {k: v for k, v in data.items() if k not in _INFO_BLACKLIST_KEYS}
     sanitized["subtitles_languages"] = sorted((data.get("subtitles") or {}).keys())
     sanitized["automatic_captions_languages"] = sorted((data.get("automatic_captions") or {}).keys())
-    sanitized["resolution_reference"] = ref  # ストリームURLは含まない参考値(解像度/FPS/ファイルサイズ)
+    sanitized["resolution_reference"] = ref
     sanitized["cache_ttl_seconds"] = RESPONSE_CACHE_TTL_SECONDS
 
     return _json_safe(sanitized)
@@ -1869,8 +1913,6 @@ def info(video_id):
     with _track_processing(video_id, "info"):
         data = _extract_full(video_id)
 
-        # 投稿者のアバター画像。yt-dlpの info dict には入っていないので、
-        # watch pageのytInitialDataから channel/related と同じ要領で拾ってくる。
         channel_avatar_url = None
         want_base64 = request.args.get("base64", "1") != "0"
         try:
@@ -1880,7 +1922,6 @@ def info(video_id):
                 if yt_data:
                     channel_avatar_url = _find_video_owner_avatar(yt_data)
                     if not channel_avatar_url:
-                        # videoOwnerRendererが見つからない場合の最終手段
                         channel_avatar_url = _find_named_image_url(yt_data, "avatar")
         except ApiError:
             pass
@@ -1900,7 +1941,6 @@ def info(video_id):
     return jsonify(result)
 
 
-# ---------- stream (全ストリームURL一覧。あればHLS直リンクも) ----------
 
 _STREAM_FIELDS = [
     "format_id", "format_note", "ext", "resolution", "width", "height", "fps",
@@ -1929,10 +1969,7 @@ def _build_stream_payload(video_id, data):
         "title": data.get("title"),
         "is_live": data.get("is_live", False),
         "streams": streams,
-        "hls_url": hls_url,  # yt-dlpが返す実際のHLS(m3u8)直リンク。無い場合はnull
-        # streams[].url はサーバーが解決した時のIPに紐付いていることがあり、
-        # ブラウザから直接叩くと再生できない場合がある。その時はこちらを使う。
-        # {format_id} を streams[].format_id に置き換えて叩けば、サーバー側で中継してくれる。
+        "hls_url": hls_url,
         "proxy_url_template": f"/api/proxy-stream/{video_id}?format_id={{format_id}}",
         "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
     })
@@ -1980,8 +2017,6 @@ def proxy_stream(video_id):
     """
     format_id = request.args.get("format_id", "18")
     range_header = request.headers.get("Range")
-    # googlevideo等のCDNは、素のPython requestsのUser-Agent(python-requests/x.x)だと
-    # リクエストを弾いてくることがある。ブラウザっぽいヘッダを付けて回避する。
     fwd_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -2001,7 +2036,6 @@ def proxy_stream(video_id):
             upstream.close()
             raise requests.RequestException(f"upstream returned {upstream.status_code}")
     except requests.RequestException:
-        # キャッシュしていたURLが失効している可能性があるので、1回だけ再解決してリトライ
         try:
             upstream = _try_fetch(use_cache=False)
         except requests.RequestException as e:
@@ -2032,8 +2066,6 @@ def proxy_stream(video_id):
                 if chunk:
                     yield chunk
         except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ConnectionError):
-            # ブラウザ側がシーク/画質切替/ページ離脱等で接続を切っただけの、よくあるケース。
-            # サーバーログを例外で汚さないよう、ここで黙って終了する。
             pass
         finally:
             upstream.close()
