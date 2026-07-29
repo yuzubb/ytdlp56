@@ -351,19 +351,21 @@ def _resolve_playlist_url(playlist_id):
     return f"https://www.youtube.com/playlist?list={decoded}"
 
 
-def _resolve_channel_url(channel_id):
+def _resolve_channel_url(channel_id, tab="videos"):
     """
     channel_idがURLならデコードしてそのまま使う。
     '@handle' 形式、'UCxxxx' 形式のチャンネルID、素のハンドル名のどれでも受け付ける。
+    tabは "videos"(通常の投稿動画) / "streams"(過去のライブ配信アーカイブ) /
+    "shorts" / "playlists" のいずれか。YouTubeチャンネルページのタブ切り替えに対応する。
     """
     decoded = urllib.parse.unquote(channel_id)
     if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", decoded):
         return decoded
     if decoded.startswith("@"):
-        return f"https://www.youtube.com/{decoded}/videos"
+        return f"https://www.youtube.com/{decoded}/{tab}"
     if decoded.startswith("UC") and len(decoded) > 10:
-        return f"https://www.youtube.com/channel/{decoded}/videos"
-    return f"https://www.youtube.com/@{decoded}/videos"
+        return f"https://www.youtube.com/channel/{decoded}/{tab}"
+    return f"https://www.youtube.com/@{decoded}/{tab}"
 
 
 def _sanitize_id(video_id):
@@ -431,15 +433,16 @@ def _ydl_opts(extra=None):
         "nocheckcertificate": True,
         # YouTubeは視聴環境の言語設定によっては、オリジナルが日本語のタイトルでも
         # 自動翻訳された英語タイトルを返してくることがある。明示的にjaを指定して抑える。
-        # player_client=mweb は PO Token (bgutil provider) が対応しているクライアントを
-        # 明示的に選ぶための指定。他のクライアント(android_vr等)だとPO Tokenがあっても
-        # LOGIN_REQUIREDになることが確認できたため、mwebを必須で含めている。
-        # mweb単体だと一部動画でitag18(既定の360p)等のフォーマットが欠けることが
-        # あったため、webも一緒に指定してフォーマットの取得元を広げている
-        # (webがBot判定で失敗しても、mweb側の結果があるので全体は失敗しない)。
-        "extractor_args": {"youtube": {"lang": ["ja"], "player_client": ["mweb", "web"]}},
+        #
+        # player_clientはあえて指定していない。以前はPO Token方式のためmweb/webに
+        # 固定していたが、PO Token用のサーバー(bgutil)を常時起動し続けるのが
+        # 運用上つらかったため、cookies.txtによる認証に一本化した。
+        # ログイン済みcookieがあれば、yt-dlp標準のクライアント選択で
+        # 通常問題なくフォーマット一覧が取得できる。
+        "extractor_args": {"youtube": {"lang": ["ja"]}},
         # 2025年後半以降、署名解読(nシグネチャ等)に外部JSランタイムが事実上必須になった。
         # Termuxにはdeno(既定ランタイム)が無いのでnodeを明示的に有効化する。
+        # (これはcookies.txt方式でも引き続き必要)
         "js_runtimes": {"node": {}},
         # 署名解読スクリプト本体(EJS)をGitHubから取得することを許可する設定。
         # これが無いと "Signature solving failed" で一部/全部のフォーマットが欠落する。
@@ -498,7 +501,7 @@ def _extract_flat(url, playliststart=None, playlistend=None):
         "no_warnings": True,
         "nocheckcertificate": True,
         "extract_flat": "in_playlist",
-        "extractor_args": {"youtube": {"lang": ["ja"], "player_client": ["mweb", "web"]}},
+        "extractor_args": {"youtube": {"lang": ["ja"]}},
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
     }
@@ -1091,25 +1094,35 @@ def playlist(playlist_id):
 @app.get("/api/channel/<channel_id>")
 def channel(channel_id):
     """
-    チャンネルのメタ情報+投稿動画一覧(flat抽出)。?limit=&offset=で範囲指定。
+    チャンネルのメタ情報+投稿一覧(flat抽出)。?limit=&offset=で範囲指定。
     channel_id は '@handle'、'UCxxxx'、素のハンドル名、フルURLのいずれでも指定可能。
+    ?tab= で YouTube本家のタブ切り替えに相当する一覧を取得できる:
+      videos(既定・通常の投稿動画) / streams(過去のライブ配信アーカイブ) /
+      shorts / playlists(再生リスト一覧)
 
     アバター/バナーはyt-dlpのextract_flatだけでは取れない(特にバナー)ため、
     チャンネルページのytInitialDataを別途取得してrelated/trendingと同じ要領で
     "avatar" / "banner" というキーを持つノードを総当たりで探している。
     見つかった画像はサーバー側で取得してbase64のdata URIにしてから返す
     (ホットリンク周りの問題を避けるため。?base64=0を付けると元のURLのままにできる)。
+
+    entries内の各動画にも、このチャンネル自身のアバターをchannel_thumbnailとして
+    埋め込んでいる(このページの動画は全部同じチャンネルのものなので、動画1本ずつに
+    ついて別途アバターを探しに行く必要が無いため)。
     """
     limit = max(1, min(int(request.args.get("limit", 50)), 500))
     offset = max(0, int(request.args.get("offset", 0)))
     want_base64 = request.args.get("base64", "1") != "0"
+    tab = request.args.get("tab", "videos")
+    if tab not in ("videos", "streams", "shorts", "playlists"):
+        tab = "videos"
 
-    key = f"channel:{channel_id}:{limit}:{offset}:{want_base64}"
+    key = f"channel:{channel_id}:{tab}:{limit}:{offset}:{want_base64}"
     cached = _response_cache_get(key)
     if cached is not None:
         return jsonify(cached)
 
-    url = _resolve_channel_url(channel_id)
+    url = _resolve_channel_url(channel_id, tab)
     with _track_processing(channel_id, "channel"):
         info = _extract_flat(url, playliststart=offset + 1, playlistend=offset + limit)
 
@@ -1144,10 +1157,22 @@ def channel(channel_id):
         avatar_b64 = _image_to_data_uri(avatar_url) if want_base64 else None
         banner_b64 = _image_to_data_uri(banner_url) if want_base64 else None
 
-    entries = [_slim_entry(e) for e in (info.get("entries") or [])]
+    channel_name = info.get("channel") or info.get("uploader") or info.get("title")
+    avatar_for_entries = avatar_b64 or avatar_url
+
+    entries = []
+    for e in (info.get("entries") or []):
+        slim = _slim_entry(e)
+        # このページの動画は全部同じチャンネルのものなので、名前/アイコンが
+        # 個別に取れていなければチャンネル側の情報で埋める。
+        slim["channel"] = slim.get("channel") or channel_name
+        slim["channel_id"] = slim.get("channel_id") or (info.get("channel_id") or channel_id)
+        slim["channel_thumbnail"] = avatar_for_entries
+        entries.append(slim)
+
     result = _json_safe({
         "channel_id": info.get("channel_id") or info.get("id") or channel_id,
-        "channel": info.get("channel") or info.get("uploader") or info.get("title"),
+        "channel": channel_name,
         "channel_follower_count": info.get("channel_follower_count"),
         "description": info.get("description"),
         "webpage_url": info.get("webpage_url"),
@@ -1155,6 +1180,7 @@ def channel(channel_id):
         "avatar_base64": avatar_b64,
         "banner": banner_url,
         "banner_base64": banner_b64,
+        "tab": tab,
         "entry_count_total": info.get("playlist_count"),
         "entry_count_returned": len(entries),
         "entries": entries,
@@ -1798,6 +1824,9 @@ def _resolve_direct_url(video_id, format_id, use_cache=True):
     """
     指定フォーマットのCDN直リンクを取得する。/api/proxy-stream 用に短時間キャッシュする
     (毎回のRangeリクエストごとにyt-dlpを叩き直すと遅すぎるため)。
+
+    指定されたformat_idがその動画に存在しない場合(YouTube側がプログレッシブ
+    フォーマットを提供していない動画がある)、エラーにせず"best"にフォールバックする。
     """
     cache_key = (video_id, format_id)
     if use_cache and cache_key in _STREAM_URL_CACHE:
@@ -1806,7 +1835,13 @@ def _resolve_direct_url(video_id, format_id, use_cache=True):
             return cached_url
 
     source_url = _resolve_url(video_id)
-    data = _extract(source_url, {"format": format_id})
+    try:
+        data = _extract(source_url, {"format": format_id})
+    except ApiError:
+        if format_id == "best":
+            raise
+        data = _extract(source_url, {"format": "best"})
+
     stream_url = data.get("url")
     if not stream_url and data.get("requested_formats"):
         stream_url = data["requested_formats"][0].get("url")
