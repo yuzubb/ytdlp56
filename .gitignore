@@ -11,6 +11,11 @@ cookies.txt
 admin_password.txt
 shared_secret.txt
 session_secret.txt
+frontend_secret.txt
 
 # ユーザーアカウント情報(パスワードハッシュ含む)
 auth_data/
+
+# キャッシュ・掲示板データ(SQLite)
+*.db
+*.db-journal

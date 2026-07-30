@@ -1,6 +1,7 @@
 flask>=3.0
 requests>=2.31
 yt-dlp>=2024.8.6
+gunicorn>=22.0
 
 # 以下は任意(cookies.txtの代わりにPO Tokenでbot判定回避したい場合のみ)。
 # 別途Node.js製のトークン生成サーバーも必要。詳細はREADMEの

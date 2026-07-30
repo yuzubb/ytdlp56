@@ -48,6 +48,7 @@ cookies.txtについて:
 import os
 import string
 import secrets
+import hashlib
 import re
 import html as html_module
 import itsdangerous
@@ -61,18 +62,22 @@ import sqlite3
 import threading
 import urllib.parse
 import urllib.request
-import http.cookiejar
 import urllib.error
 import contextlib
 from datetime import datetime
 
 import requests
 import yt_dlp
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, render_template, abort
 
 app = Flask(__name__)
 
 TMP_DIR_PATH = os.environ.get("YTDLP_API_TMP", os.path.join(os.path.expanduser("~"), "ytdlp_api_tmp"))
+
+# VPNだと接続断や自動再接続の制御が難しいため、代わりにHTTP/SOCSプロキシを直接指定できる
+# ようにしている。例: "http://user:pass@host:port" や "socks5://host:port"。
+# 未設定なら何もせず、これまで通り直接通信する。
+PROXY_URL = os.environ.get("YTDLP_API_PROXY_URL", "").strip()
 os.makedirs(TMP_DIR_PATH, exist_ok=True)
 
 COOKIES_FILE_PATH = os.environ.get(
@@ -81,17 +86,46 @@ COOKIES_FILE_PATH = os.environ.get(
 )
 
 
+class _SimpleCookie:
+    """http.cookiejar.Cookieの代わりに使う最小限の入れ物(.name/.value/.domainだけ)。"""
+    __slots__ = ("name", "value", "domain")
+
+    def __init__(self, name, value, domain):
+        self.name = name
+        self.value = value
+        self.domain = domain
+
+
 def _load_cookiejar():
-    """cookies.txt (Netscape形式)を読み込む。無い/壊れてる場合はNoneを返すだけで、
-    呼び出し側はcookie無しの状態にフォールバックできる。"""
+    """
+    cookies.txt (Netscape形式)を読み込む。無い場合はNoneを返すだけで、
+    呼び出し側はcookie無しの状態にフォールバックできる。
+
+    Python標準の http.cookiejar.MozillaCookieJar は、ファイル内のたった1行でも
+    形式がおかしいと(タブ区切りで7項目無い等)ファイル全体の読み込みごと
+    失敗してしまう(せっかく他の行が正しくても全部無視されてしまう)。
+    それだと実害が大きいので、ここでは1行ずつ自前でパースして、
+    おかしい行だけ読み飛ばす方式にしている。
+    """
     if not os.path.isfile(COOKIES_FILE_PATH):
         return None
-    jar = http.cookiejar.MozillaCookieJar(COOKIES_FILE_PATH)
+    cookies = []
     try:
-        jar.load(ignore_discard=True, ignore_expires=True)
-    except (OSError, http.cookiejar.LoadError):
+        with open(COOKIES_FILE_PATH, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 7:
+                    continue
+                domain, _flag, _path, _secure, _expires, name, value = parts
+                if not name:
+                    continue
+                cookies.append(_SimpleCookie(name, value, domain))
+    except OSError:
         return None
-    return jar
+    return cookies or None
 
 
 def _cookie_header_string():
@@ -137,14 +171,41 @@ def _get_or_create_secret(env_var_name, file_name, length=48):
 ADMIN_PASSWORD = _get_or_create_secret("YTDLP_API_ADMIN_PASSWORD", "admin_password.txt")
 
 
+_TOKEN_EXEMPT_API_PATHS = {"/api/token/issue", "/api/token/verify"}
+
+
 @app.before_request
-def _log_api_access():
-    """/api/ 配下へのアクセスをログに残すだけ(認証はしない)。
-    キャッシュ削除等の破壊的操作は _require_admin_password() で別途保護している。"""
+def _enforce_api_token():
+    """
+    /api (ドキュメントページ) と /api/ 配下は、有効なトークンが無いと404を返す。
+    401/403ではなくあえて404にしているのは、「何かあるけど弾かれている」ことすら
+    悟らせないため(存在自体が分からないようにする、という要望に対応)。
+    トークンの発行・検証エンドポイント自体は、そもそもトークンを取得する手段なので例外。
+
+    ytdlp_frontendだけは、公開トークンではなく専用の合言葉(FRONTEND_BYPASS_SECRET)を
+    X-Frontend-Secretヘッダで送ることでこのチェックを素通りできる。一般の人はこの値を
+    知りようがないので安全性は変わらない。
+    """
     path = request.path
-    if not path.startswith("/api/"):
+    if path != "/api" and not path.startswith("/api/"):
         return None
+
     client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "")
+
+    if path in _TOKEN_EXEMPT_API_PATHS:
+        print(f"[access] {client_ip} -> {request.method} {path}")
+        return None
+
+    if request.headers.get("X-Frontend-Secret", "") == FRONTEND_BYPASS_SECRET:
+        print(f"[access] {client_ip} -> {request.method} {path} (frontend)")
+        return None
+
+    token = request.headers.get("X-API-Token") or request.args.get("token", "")
+    result = _verify_public_token(token) if token else {"valid": False}
+    if not result.get("valid"):
+        print(f"[access-denied] {client_ip} -> {request.method} {path} (no/invalid token)")
+        abort(404)
+
     print(f"[access] {client_ip} -> {request.method} {path}")
     return None
 
@@ -206,7 +267,54 @@ SESSION_MAX_AGE = 7 * 24 * 3600
 _SESSION_SECRET_KEY = _get_or_create_secret("YTDLP_API_SESSION_SECRET", "session_secret.txt")
 _session_serializer = itsdangerous.URLSafeTimedSerializer(_SESSION_SECRET_KEY, salt="yuzutube-session")
 
+# ytdlp_frontendだけが知っている固定の合言葉。これを持っていれば、一般公開している
+# 1日有効のトークンを毎回取りに行かなくても /api/* を素通りできる(一般の人はこの値を
+# 知りようがないので、公開トークン方式のセキュリティには影響しない)。
+FRONTEND_BYPASS_SECRET = _get_or_create_secret("YTDLP_API_FRONTEND_SECRET", "frontend_secret.txt")
+
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# ---------- 表向きサイト用のトークン発行ツール ----------
+# ちょいツール(表の顔)に置く「トークン発行」用。このサーバーの秘密鍵で署名しているので、
+# 見た目はただの文字列でも、このサイト(このサーバー)でしか発行・検証できない
+# (秘密鍵を知らない第三者が同じ形式の文字列を偽造することはできない)。
+PUBLIC_TOKEN_MAX_AGE = 24 * 3600  # 1日
+_public_token_serializer = itsdangerous.URLSafeTimedSerializer(_SESSION_SECRET_KEY, salt="yuzutube-public-token")
+
+
+def _issue_public_token():
+    token_id = secrets.token_hex(8)
+    issued_at = time.time()
+    token = _public_token_serializer.dumps({"id": token_id, "issued_at": issued_at})
+    return {
+        "token": token,
+        "issued_at": issued_at,
+        "expires_at": issued_at + PUBLIC_TOKEN_MAX_AGE,
+    }
+
+
+def _verify_public_token(token):
+    try:
+        data = _public_token_serializer.loads(token, max_age=PUBLIC_TOKEN_MAX_AGE)
+    except itsdangerous.SignatureExpired:
+        return {"valid": False, "reason": "expired"}
+    except itsdangerous.BadSignature:
+        return {"valid": False, "reason": "invalid"}
+    remaining = PUBLIC_TOKEN_MAX_AGE - (time.time() - data["issued_at"])
+    return {"valid": True, "issued_at": data["issued_at"], "expires_in_seconds": max(0, int(remaining))}
+
+
+@app.get("/api/token/issue")
+def token_issue():
+    return jsonify(_issue_public_token())
+
+
+@app.get("/api/token/verify")
+def token_verify():
+    token = request.args.get("token", "")
+    if not token:
+        raise ApiError(400, "token parameter is required")
+    return jsonify(_verify_public_token(token))
 
 
 def _load_users():
@@ -560,19 +668,29 @@ def _decompress_body(raw, content_encoding):
     return raw
 
 
+if PROXY_URL:
+    _proxy_opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL})
+    )
+    _urlopen = _proxy_opener.open
+else:
+    _urlopen = urllib.request.urlopen
+
+
 def _fetch_page(url, timeout=60):
     """
     YouTubeの生HTMLページを取ってくる。requestsではなくPython標準ライブラリ(urllib)を
     使っている。requests(urllib3)だとブロックされるケースでも、urllibだとTLS/HTTPの
     フィンガープリントが変わって通ることがあるため、生スクレイピング系はこちらに統一した。
     cookies.txtが置いてあれば、そのcookieも一緒に送る(consent回避用のCONSENT/SOCSは常に付与)。
+    PROXY_URLが設定されていれば、そのプロキシ経由でリクエストする。
     """
     headers = dict(_PAGE_HEADERS)
     headers["Cookie"] = _cookie_header_string()
     req = urllib.request.Request(url, headers=headers)
     content_encoding = ""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen(req, timeout=timeout) as resp:
             status = resp.getcode()
             raw = resp.read()
             content_encoding = resp.headers.get("Content-Encoding", "")
@@ -606,6 +724,8 @@ def _ydl_opts(extra=None):
             "Sec-Ch-Ua-Platform": '"Windows"',
         },
     }
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
     if os.path.isfile(COOKIES_FILE_PATH):
         opts["cookiefile"] = COOKIES_FILE_PATH
     if extra:
@@ -631,12 +751,41 @@ def _handle_api_error(err):
     return jsonify({"detail": err.message}), err.status_code
 
 
-def _extract(source_url, extra_opts=None):
-    try:
-        with yt_dlp.YoutubeDL(_ydl_opts(extra_opts)) as ydl:
-            return ydl.extract_info(source_url, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        raise ApiError(400, f"yt-dlp error: {e}")
+_NETWORK_ERROR_HINTS = (
+    "urlopen error", "connection refused", "network is unreachable",
+    "temporary failure in name resolution", "timed out", "timeout",
+    "failed to resolve", "connection reset", "no route to host",
+    "unreachable", "eof occurred in violation of protocol",
+    "connection aborted", "remote end closed connection",
+)
+
+
+def _looks_like_network_error(message):
+    lowered = message.lower()
+    return any(hint in lowered for hint in _NETWORK_ERROR_HINTS)
+
+
+def _extract(source_url, extra_opts=None, retries=2, retry_delay=1.5):
+    """
+    VPN切断・回線の瞬断など「サーバー側は悪くないが一時的にネットが繋がらない」ケースを
+    ある程度自動で吸収するため、ネットワーク起因のエラーだけ数回リトライする。
+    それでもダメならHTTP 400ではなく503(Service Unavailable)を返す
+    (400は「リクエスト自体がおかしい」という意味なので、一時的な接続断には不適切)。
+    動画が存在しない・非公開などの本当のエラーは、リトライせず通常通り400のまま。
+    """
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            with yt_dlp.YoutubeDL(_ydl_opts(extra_opts)) as ydl:
+                return ydl.extract_info(source_url, download=False)
+        except yt_dlp.utils.DownloadError as e:
+            message = str(e)
+            if not _looks_like_network_error(message):
+                raise ApiError(400, f"yt-dlp error: {message}")
+            last_error = message
+            if attempt < retries:
+                time.sleep(retry_delay)
+    raise ApiError(503, f"ネットワーク接続が不安定です(VPN切断等の可能性)。しばらくしてから再度お試しください: {last_error}")
 
 
 def _extract_full(video_id):
@@ -667,6 +816,8 @@ def _extract_flat(url, playliststart=None, playlistend=None):
             "Sec-Ch-Ua-Platform": '"Windows"',
         },
     }
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
     if os.path.isfile(COOKIES_FILE_PATH):
         opts["cookiefile"] = COOKIES_FILE_PATH
     if playliststart is not None:
@@ -766,8 +917,41 @@ _API_DOCS_HTML = """<!doctype html>
   <h1>ytdlp_api</h1>
   <div class="sub">yt-dlp powered API (no UI, docs only) &middot; <a href="/api/stats">/api/stats ダッシュボードはこちら</a></div>
 
+  <div class="card">
+    <div class="desc">
+      このページを含む /api/* 全体は有効なトークンが無いと404になります
+      (表向きのツールサイトの「トークン発行」から取得してください)。
+      下の欄に貼っておけば、このページのテストボタンにも自動で使われます
+      (このブラウザだけに保存されます)。
+    </div>
+    <div class="params">
+      <label>APIトークン
+        <input type="text" id="apiTokenInput" placeholder="トークン発行ツールで取得した文字列">
+      </label>
+    </div>
+    <button class="run" id="apiTokenSaveBtn">保存</button>
+  </div>
+
   <div id="cards"></div>
 
+<script>
+const API_TOKEN_STORAGE_KEY = "ytdlp_api_docs_token";
+
+function currentApiToken() {
+  const fromUrl = new URLSearchParams(window.location.search).get("token");
+  if (fromUrl) {
+    localStorage.setItem(API_TOKEN_STORAGE_KEY, fromUrl);
+    return fromUrl;
+  }
+  return localStorage.getItem(API_TOKEN_STORAGE_KEY) || "";
+}
+
+document.getElementById("apiTokenInput").value = currentApiToken();
+document.getElementById("apiTokenSaveBtn").addEventListener("click", () => {
+  localStorage.setItem(API_TOKEN_STORAGE_KEY, document.getElementById("apiTokenInput").value.trim());
+});
+
+</script>
 <script>
 const ENDPOINTS = [
   { method: "GET", path: "/api/health", desc: "死活監視", params: [] },
@@ -883,7 +1067,7 @@ function buildCard(ep, index) {
 
     const startedAt = performance.now();
     try {
-      const res = await fetch(url, { method: ep.method });
+      const res = await fetch(url, { method: ep.method, headers: { "X-API-Token": localStorage.getItem(API_TOKEN_STORAGE_KEY) || "" } });
       const elapsed = Math.round(performance.now() - startedAt);
       const text = await res.text();
       let pretty = text;
@@ -910,6 +1094,12 @@ ENDPOINTS.forEach((ep, i) => container.appendChild(buildCard(ep, i)));
 </body>
 </html>
 """
+
+
+@app.get("/")
+def landing_page():
+    return render_template("landing.html")
+
 
 
 @app.get("/api")
@@ -1160,6 +1350,38 @@ def cache_delete_all():
         "response_cache_entries_removed": response_count,
     })
 
+
+
+@app.get("/api/suggest")
+def suggest():
+    """
+    検索窓の入力補完(サジェスト)。YouTubeの検索ボックスと同じ公開サジェストAPIを使う。
+    認証不要で軽量。client=firefox を指定すると、JSONPでラップされずに
+    ["検索語", ["候補1", "候補2", ...]] という素のJSON配列で返ってくるので、
+    JSONPの中身を取り出すパース処理が不要になり壊れにくい。
+    """
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"query": q, "suggestions": []})
+
+    url = (
+        "https://suggestqueries.google.com/complete/search"
+        f"?client=firefox&ds=yt&hl=ja&gl=JP&q={urllib.parse.quote(q)}"
+    )
+    try:
+        resp = _fetch_page(url, timeout=10)
+    except ApiError:
+        return jsonify({"query": q, "suggestions": []})
+    if resp.status_code >= 400:
+        return jsonify({"query": q, "suggestions": []})
+
+    suggestions = []
+    try:
+        data = json.loads(resp.text)
+        suggestions = [s for s in (data[1] or []) if s]
+    except (json.JSONDecodeError, IndexError, TypeError):
+        suggestions = []
+    return jsonify({"query": q, "suggestions": suggestions[:10]})
 
 
 @app.get("/api/search")
@@ -1639,7 +1861,7 @@ def _fetch_youtube_continuation(endpoint, api_key, context, continuation_token, 
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     content_encoding = ""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
             content_encoding = resp.headers.get("Content-Encoding", "")
     except urllib.error.HTTPError as e:
@@ -2020,6 +2242,8 @@ _http.headers.update({
     ),
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
 })
+if PROXY_URL:
+    _http.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
 _http.cookies.set("CONSENT", "YES+1", domain=".youtube.com")
 _http.cookies.set("SOCS", "CAI", domain=".youtube.com")
 
