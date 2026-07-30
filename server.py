@@ -1859,6 +1859,78 @@ _CHANNEL_THUMBNAIL_PATHS = (
 )
 
 
+def _parse_lockup_view_model(node):
+    """
+    YouTubeの新しいUI形式(lockupViewModel)を解析する。
+    videoRenderer等の従来形式とは構造がまるで違う(videoIdはcontentId、
+    titleはmetadata.lockupMetadataViewModel.title.content、という具合に
+    ネストが深く名前も違う)ため、_looks_like_videoの単純な総当たりでは拾えない。
+    このノード形式専用の解析経路を別途用意している。
+    """
+    lockup = node.get("lockupViewModel")
+    if not isinstance(lockup, dict):
+        return None
+
+    video_id = lockup.get("contentId")
+    if not video_id:
+        return None
+
+    metadata_vm = _dig(lockup, "metadata", "lockupMetadataViewModel") or {}
+    title = _dig(metadata_vm, "title", "content")
+    if not title:
+        return None
+
+    content_metadata = _dig(metadata_vm, "metadata", "contentMetadataViewModel") or {}
+    metadata_rows = content_metadata.get("metadataRows") or []
+
+    channel_row = _dig(metadata_rows, 0, "metadataParts", 0) if metadata_rows else None
+    channel_name = _dig(channel_row, "text", "content") if channel_row else None
+
+    stats_row = _dig(metadata_rows, 1, "metadataParts") if len(metadata_rows) > 1 else None
+    views_text = _dig(stats_row, 0, "text", "content") if stats_row else None
+
+    thumbnail_sources = (
+        _dig(lockup, "contentImage", "thumbnailViewModel", "image", "sources")
+        or _dig(lockup, "contentImage", "image", "sources")
+        or []
+    )
+    thumbnail_url = thumbnail_sources[-1]["url"] if thumbnail_sources else None
+
+    avatar_data = _dig(metadata_vm, "image", "decoratedAvatarViewModel", "avatar", "avatarViewModel")
+    channel_avatar = _dig(avatar_data, "image", "sources", 0, "url") if avatar_data else None
+    channel_url = _dig(
+        metadata_vm, "image", "decoratedAvatarViewModel", "rendererContext",
+        "commandContext", "onTap", "innertubeCommand", "browseEndpoint", "canonicalBaseUrl",
+    )
+    channel_id = None
+    if channel_url:
+        channel_id = channel_url.strip("/").rsplit("/", 1)[-1] or None
+
+    overlays = (
+        _dig(lockup, "contentImage", "thumbnailViewModel", "overlays")
+        or _dig(lockup, "contentImage", "overlays")
+        or []
+    )
+    length_text = None
+    for overlay in overlays:
+        badge_vm = _dig(overlay, "thumbnailOverlayBadgeViewModel", "thumbnailBadges", 0, "thumbnailBadgeViewModel")
+        if badge_vm and badge_vm.get("text"):
+            length_text = badge_vm["text"]
+            break
+
+    return {
+        "video_id": video_id,
+        "title": title,
+        "channel": channel_name,
+        "channel_id": channel_id,
+        "channel_thumbnail": channel_avatar,
+        "length_text": length_text,
+        "view_count_text": views_text,
+        "thumbnail": thumbnail_url,
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+    }
+
+
 def _looks_like_video(node):
     if not isinstance(node, dict):
         return False
@@ -1879,11 +1951,26 @@ def _parse_video_cards(yt_data, exclude_id, limit):
     (レンダラー自体の形が大きく変わらない限り)そのまま動く。
     関連動画(watch pageのsecondaryResults)にもトレンド(トップページのrichGrid)にも
     そのまま使い回せる。
+
+    従来形式(videoRenderer等)と新形式(lockupViewModel)の両方に対応している。
     """
     seen = set()
     entries = []
 
     for node in _walk(yt_data):
+        if not isinstance(node, dict):
+            continue
+
+        if "lockupViewModel" in node:
+            parsed = _parse_lockup_view_model(node)
+            if not parsed or parsed["video_id"] == exclude_id or parsed["video_id"] in seen:
+                continue
+            seen.add(parsed["video_id"])
+            entries.append(parsed)
+            if len(entries) >= limit:
+                break
+            continue
+
         if not _looks_like_video(node):
             continue
 
