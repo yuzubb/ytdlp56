@@ -6,3 +6,11 @@ ytdlp_api_tmp/
 
 # YouTubeのログインセッションが入っている機密ファイル。絶対にコミット/共有しないこと。
 cookies.txt
+
+# 自動生成されるパスワード/シークレット類
+admin_password.txt
+shared_secret.txt
+session_secret.txt
+
+# ユーザーアカウント情報(パスワードハッシュ含む)
+auth_data/

@@ -1187,8 +1187,9 @@ def search():
         with _track_processing(f"search:{q}", "search"):
             resp = _fetch_page(_add_lang_params(_build_search_url()), timeout=60)
             api_key, context = _extract_ytcfg(resp.text)
-            if not api_key or not context:
-                raise ApiError(502, "failed to resolve continuation context")
+            if not context:
+                # ytcfgから取れなくても、最低限のクライアント情報だけで継続取得を試みる
+                context = {"client": {"hl": "ja", "gl": "JP", "clientName": "WEB", "clientVersion": "2.20240101.00.00"}}
             cont_data = _fetch_youtube_continuation("search", api_key, context, continuation_token)
             entries = _parse_video_cards(cont_data, None, limit)
             next_token = _find_continuation_token(cont_data)
@@ -1584,15 +1585,29 @@ def _find_balanced_json(text, start_idx):
     return None
 
 
+# YouTubeの一般公開Webクライアントが常に使っている既知の固定キー(個人のものではなく、
+# YouTube全体で共通の値)。ytcfgからの抽出に失敗した時のフォールバックとして使う。
+_FALLBACK_INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+
+
 def _extract_ytcfg(html):
-    m = re.search(r"ytcfg\.set\(\s*(\{.+?\})\s*\)\s*;", html)
-    if not m:
-        return None, None
-    try:
-        cfg = json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return None, None
-    return cfg.get("INNERTUBE_API_KEY"), cfg.get("INNERTUBE_CONTEXT")
+    """
+    ページ内には ytcfg.set({...}) が複数回出てくることがあり、1回目の呼び出しだけでは
+    INNERTUBE_API_KEY や INNERTUBE_CONTEXT が揃っていないことがある。
+    見つかった全部をマージしてから必要な値を取り出す。
+    """
+    merged = {}
+    for m in re.finditer(r"ytcfg\.set\(\s*(\{.+?\})\s*\)\s*;", html):
+        try:
+            cfg = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(cfg, dict):
+            merged.update(cfg)
+    if not merged:
+        return _FALLBACK_INNERTUBE_API_KEY, None
+    api_key = merged.get("INNERTUBE_API_KEY") or _FALLBACK_INNERTUBE_API_KEY
+    return api_key, merged.get("INNERTUBE_CONTEXT")
 
 
 def _find_continuation_token(yt_data):
@@ -1614,12 +1629,30 @@ def _fetch_youtube_continuation(endpoint, api_key, context, continuation_token, 
     headers = dict(_PAGE_HEADERS)
     headers["Content-Type"] = "application/json"
     headers["Cookie"] = _cookie_header_string()
+    # youtubei側はクライアント識別ヘッダーも見ていることがあるため、contextから拾って付与する
+    client = (context or {}).get("client", {})
+    if client.get("clientName"):
+        headers["X-Youtube-Client-Name"] = "1"
+    if client.get("clientVersion"):
+        headers["X-Youtube-Client-Version"] = client["clientVersion"]
+
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    content_encoding = ""
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8", errors="replace"))
-    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError) as e:
-        raise ApiError(502, f"failed to fetch continuation: {e}")
+            raw = resp.read()
+            content_encoding = resp.headers.get("Content-Encoding", "")
+    except urllib.error.HTTPError as e:
+        raw = e.read() if e.fp else b""
+        content_encoding = e.headers.get("Content-Encoding", "") if e.headers else ""
+    except urllib.error.URLError as e:
+        raise ApiError(502, f"failed to fetch continuation: {e.reason}")
+
+    raw = _decompress_body(raw, content_encoding)
+    try:
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as e:
+        raise ApiError(502, f"failed to parse continuation response: {e}")
 
 
 def _extract_yt_initial_data(html):
