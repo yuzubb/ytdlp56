@@ -1,0 +1,12 @@
+flask>=3.0
+requests>=2.31
+yt-dlp>=2024.8.6
+gunicorn>=22.0
+Pillow>=10.0
+python-dotenv>=1.0
+
+# 以下は任意(cookies.txtの代わりにPO Tokenでbot判定回避したい場合のみ)。
+# 別途Node.js製のトークン生成サーバーも必要。詳細はREADMEの
+# 「ブラウザ拡張機能が使えない場合: PO Token方式」を参照。
+# bgutil-ytdlp-pot-provider を使う場合、yt-dlpは2025.05.22以上が必要です。
+# pip install -U bgutil-ytdlp-pot-provider --break-system-packages
