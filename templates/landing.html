@@ -1,0 +1,1083 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ちょいツール - 無料のブラウザ完結ツール集</title>
+  <meta name="description" content="QRコード生成、文字数カウント、パスワード生成、単位変換など。会員登録不要、広告なし、すべてブラウザ内で完結します。">
+  <style>
+    * { box-sizing: border-box; }
+    :root {
+      --bg: #f7f7f5;
+      --card: #ffffff;
+      --border: #e6e6e2;
+      --text: #1c1c1a;
+      --text-sub: #8a8a84;
+      --accent: #2d6a4f;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", "Yu Gothic", sans-serif;
+      line-height: 1.7;
+      font-size: 14px;
+    }
+    a { color: var(--accent); }
+    header.site-header {
+      background: var(--card);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 20px;
+    }
+    header.site-header .inner { max-width: 920px; margin: 0 auto; display: flex; align-items: baseline; gap: 10px; }
+    .site-title { font-size: 17px; font-weight: 700; }
+    .site-tagline { font-size: 11px; color: var(--text-sub); }
+
+    .layout { max-width: 920px; margin: 0 auto; padding: 24px 16px 60px; display: flex; gap: 24px; align-items: flex-start; }
+    nav.tool-nav {
+      width: 190px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      position: sticky;
+      top: 20px;
+    }
+    nav.tool-nav button {
+      text-align: left;
+      background: none;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 13px;
+      font-family: inherit;
+      color: var(--text-sub);
+      cursor: pointer;
+    }
+    nav.tool-nav button:hover { background: var(--border); }
+    nav.tool-nav button.active { background: var(--accent); color: white; }
+
+    main.tool-main { flex: 1; min-width: 0; }
+    .tool-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 22px;
+    }
+    .tool-card h1 { font-size: 18px; margin: 0 0 6px; }
+    .tool-card .lead { color: var(--text-sub); font-size: 13px; margin: 0 0 20px; }
+
+    textarea, input[type=text], input[type=number], select {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 14px;
+      font-family: inherit;
+      background: var(--bg);
+      color: var(--text);
+    }
+    textarea:focus, input:focus, select:focus { outline: none; border-color: var(--accent); }
+    textarea { min-height: 100px; resize: vertical; }
+    label { font-size: 12px; color: var(--text-sub); display: block; margin-bottom: 5px; }
+    .field { margin-bottom: 14px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .row .field { flex: 1; min-width: 130px; }
+
+    .btn {
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 9px 20px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn.secondary { background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+    .btn:disabled { opacity: 0.5; cursor: default; }
+
+    .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 10px; margin-top: 16px; }
+    .stat-box { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px; text-align: center; }
+    .stat-box .num { font-size: 20px; font-weight: 700; }
+    .stat-box .label { font-size: 11px; color: var(--text-sub); margin-top: 2px; }
+
+    .result-area { margin-top: 18px; display: flex; flex-direction: column; align-items: center; gap: 12px; }
+    #qrcodeCanvas { background: white; padding: 12px; border-radius: 10px; border: 1px solid var(--border); }
+    #qrcodeCanvas img, #qrcodeCanvas canvas { display: block; }
+    .empty-hint { color: var(--text-sub); font-size: 12.5px; text-align: center; padding: 16px 0; }
+
+    .pw-output {
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: 16px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+      word-break: break-all;
+      margin-bottom: 12px;
+      min-height: 24px;
+    }
+    .toggle-row { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 10px; }
+
+    .color-preview { width: 100%; height: 70px; border-radius: 10px; border: 1px solid var(--border); margin-bottom: 14px; }
+    .copy-note { font-size: 11.5px; color: var(--accent); min-height: 16px; margin-top: 6px; }
+
+    .usage-box {
+      margin-top: 28px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+    }
+    .usage-box h2 { font-size: 13.5px; margin: 0 0 8px; }
+    .usage-box p { font-size: 12.5px; color: var(--text-sub); margin: 0 0 12px; }
+    .usage-method { margin-bottom: 14px; }
+    .usage-method-title { font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+    .usage-box pre {
+      background: #12161f;
+      color: #d7dae0;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 11.5px;
+      overflow-x: auto;
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .usage-note { font-size: 11px; color: var(--accent); }
+
+    footer { max-width: 920px; margin: 0 auto; padding: 20px 16px; color: var(--text-sub); font-size: 11px; }
+
+    .ad-banner {
+      display: block;
+      text-decoration: none;
+      background: linear-gradient(120deg, #1b2a4a, #0f1729);
+      border-bottom: 1px solid var(--border);
+    }
+    .ad-banner-inner {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 14px 20px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .ad-banner-badge {
+      flex-shrink: 0;
+      font-size: 10px;
+      font-weight: 700;
+      color: rgba(255,255,255,0.6);
+      border: 1px solid rgba(255,255,255,0.25);
+      border-radius: 4px;
+      padding: 2px 6px;
+    }
+    .ad-banner-body { flex: 1; min-width: 0; }
+    .ad-banner-title { color: #fff; font-size: 13.5px; font-weight: 700; }
+    .ad-banner-desc { color: rgba(255,255,255,0.7); font-size: 12px; margin-top: 2px; }
+    .ad-banner-cta { flex-shrink: 0; color: #7fa8ff; font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+    @media (max-width: 640px) {
+      .ad-banner-inner { flex-wrap: wrap; }
+      .ad-banner-cta { width: 100%; }
+    }
+
+    @media (max-width: 640px) {
+      .layout { flex-direction: column; }
+      nav.tool-nav { width: 100%; flex-direction: row; overflow-x: auto; position: static; }
+      nav.tool-nav button { white-space: nowrap; }
+    }
+  </style>
+</head>
+<body>
+  <header class="site-header">
+    <div class="inner">
+      <span class="site-title">ちょいツール</span>
+      <span class="site-tagline">無料・登録不要・ブラウザだけで完結</span>
+    </div>
+  </header>
+
+  <a class="ad-banner" href="https://discord.gg/YqjmkC9W5" target="_blank" rel="noopener noreferrer">
+    <div class="ad-banner-inner">
+      <div class="ad-banner-badge">PR</div>
+      <div class="ad-banner-body">
+        <div class="ad-banner-title">限界を超えるパフォーマンス</div>
+        <div class="ad-banner-desc">超高速NVMe SSDと強力なDDoS保護を標準装備。ゲームサーバーやVPSを、最高峰の環境で。</div>
+      </div>
+      <div class="ad-banner-cta">詳しく見る →</div>
+    </div>
+  </a>
+
+  <div class="layout">
+    <nav class="tool-nav" id="toolNav">
+      <button type="button" data-tool="qr" class="active">QRコード生成</button>
+      <button type="button" data-tool="count">文字数カウント</button>
+      <button type="button" data-tool="password">パスワード生成</button>
+      <button type="button" data-tool="unit">単位変換</button>
+      <button type="button" data-tool="color">カラーコード変換</button>
+      <button type="button" data-tool="encode">Base64 / URLエンコード</button>
+      <button type="button" data-tool="json">JSON整形</button>
+      <button type="button" data-tool="timer">タイマー / ストップウォッチ</button>
+      <button type="button" data-tool="tax">消費税計算</button>
+      <button type="button" data-tool="bmi">BMI計算</button>
+      <button type="button" data-tool="split">割り勘計算</button>
+      <button type="button" data-tool="random">乱数 / サイコロ</button>
+      <button type="button" data-tool="case">文字列ケース変換</button>
+      <button type="button" data-tool="hash">ハッシュ生成</button>
+      <button type="button" data-tool="token">トークン発行</button>
+    </nav>
+
+    <main class="tool-main">
+      <!-- QRコード生成 -->
+      <section class="tool-card" id="tool-qr">
+        <h1>QRコード生成</h1>
+        <p class="lead">入力すると自動でQRコードが表示されます。内容はサーバーに送信されず、ブラウザ内だけで完結します。</p>
+        <div class="field">
+          <label>テキスト / URL</label>
+          <textarea id="qrText" placeholder="https://example.com  または  好きな文字列"></textarea>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>サイズ</label>
+            <select id="qrSize">
+              <option value="200">小(200px)</option>
+              <option value="300" selected>中(300px)</option>
+              <option value="500">大(500px)</option>
+            </select>
+          </div>
+        </div>
+        <div class="result-area">
+          <div id="qrcodeCanvas"></div>
+          <div class="empty-hint" id="qrEmptyHint">入力すると、ここにQRコードが表示されます</div>
+          <a href="#" class="btn" id="qrDownloadBtn" style="display:none; text-decoration:none;">画像を保存</a>
+        </div>
+      </section>
+
+      <!-- 文字数カウント -->
+      <section class="tool-card" id="tool-count" style="display:none;">
+        <h1>文字数カウント</h1>
+        <p class="lead">文字数・単語数・行数をリアルタイムで数えます。SNSの文字数制限チェックなどに。</p>
+        <div class="field">
+          <textarea id="countText" placeholder="ここに文章を入力..." style="min-height:160px;"></textarea>
+        </div>
+        <div class="stat-grid">
+          <div class="stat-box"><div class="num" id="countChars">0</div><div class="label">文字数</div></div>
+          <div class="stat-box"><div class="num" id="countNoSpace">0</div><div class="label">空白除く</div></div>
+          <div class="stat-box"><div class="num" id="countLines">0</div><div class="label">行数</div></div>
+          <div class="stat-box"><div class="num" id="countWords">0</div><div class="label">単語数</div></div>
+        </div>
+      </section>
+
+      <!-- パスワード生成 -->
+      <section class="tool-card" id="tool-password" style="display:none;">
+        <h1>パスワード生成</h1>
+        <p class="lead">ランダムな安全性の高いパスワードを、ブラウザ内で生成します(サーバーには送られません)。</p>
+        <div class="pw-output" id="pwOutput">&nbsp;</div>
+        <div class="row" style="margin-bottom:14px;">
+          <button type="button" class="btn secondary" id="pwCopyBtn">コピー</button>
+          <button type="button" class="btn" id="pwRegenBtn">再生成</button>
+        </div>
+        <div class="field">
+          <label>長さ: <span id="pwLengthLabel">16</span>文字</label>
+          <input type="range" id="pwLength" min="6" max="64" value="16">
+        </div>
+        <div class="toggle-row"><label><input type="checkbox" id="pwUpper" checked> 大文字 (A-Z)</label></div>
+        <div class="toggle-row"><label><input type="checkbox" id="pwLower" checked> 小文字 (a-z)</label></div>
+        <div class="toggle-row"><label><input type="checkbox" id="pwDigits" checked> 数字 (0-9)</label></div>
+        <div class="toggle-row"><label><input type="checkbox" id="pwSymbols"> 記号 (!@#$%...)</label></div>
+        <div class="copy-note" id="pwCopyNote"></div>
+      </section>
+
+      <!-- 単位変換 -->
+      <section class="tool-card" id="tool-unit" style="display:none;">
+        <h1>単位変換</h1>
+        <p class="lead">長さ・重さ・温度をその場で変換します。</p>
+        <div class="field">
+          <label>種類</label>
+          <select id="unitCategory">
+            <option value="length">長さ</option>
+            <option value="weight">重さ</option>
+            <option value="temperature">温度</option>
+          </select>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>入力値</label>
+            <input type="number" id="unitInputValue" value="1">
+          </div>
+          <div class="field">
+            <label>変換前の単位</label>
+            <select id="unitFrom"></select>
+          </div>
+          <div class="field">
+            <label>変換後の単位</label>
+            <select id="unitTo"></select>
+          </div>
+        </div>
+        <div class="stat-box" style="text-align:left; padding:16px;">
+          <div class="label">結果</div>
+          <div class="num" id="unitResult" style="font-size:24px;">-</div>
+        </div>
+      </section>
+
+      <!-- カラーコード変換 -->
+      <section class="tool-card" id="tool-color" style="display:none;">
+        <h1>カラーコード変換</h1>
+        <p class="lead">HEX / RGB / HSL を相互に変換します。</p>
+        <div class="color-preview" id="colorPreview"></div>
+        <div class="field">
+          <label>カラーピッカー</label>
+          <input type="color" id="colorPicker" value="#2d6a4f" style="width:100%; height:40px; padding:2px;">
+        </div>
+        <div class="field">
+          <label>HEX</label>
+          <input type="text" id="colorHex" value="#2d6a4f">
+        </div>
+        <div class="row">
+          <div class="field"><label>R</label><input type="number" id="colorR" min="0" max="255"></div>
+          <div class="field"><label>G</label><input type="number" id="colorG" min="0" max="255"></div>
+          <div class="field"><label>B</label><input type="number" id="colorB" min="0" max="255"></div>
+        </div>
+        <div class="field">
+          <label>HSL</label>
+          <input type="text" id="colorHsl" readonly>
+        </div>
+      </section>
+
+      <!-- Base64 / URLエンコード -->
+      <section class="tool-card" id="tool-encode" style="display:none;">
+        <h1>Base64 / URLエンコード</h1>
+        <p class="lead">テキストのエンコード・デコードをその場で行います。</p>
+        <div class="field">
+          <label>入力</label>
+          <textarea id="encodeInput" placeholder="変換したいテキストを入力"></textarea>
+        </div>
+        <div class="row" style="margin-bottom:14px;">
+          <button type="button" class="btn" data-encode-action="base64encode">Base64 エンコード</button>
+          <button type="button" class="btn secondary" data-encode-action="base64decode">Base64 デコード</button>
+          <button type="button" class="btn" data-encode-action="urlencode">URL エンコード</button>
+          <button type="button" class="btn secondary" data-encode-action="urldecode">URL デコード</button>
+        </div>
+        <div class="field">
+          <label>結果</label>
+          <textarea id="encodeOutput" readonly></textarea>
+        </div>
+        <div class="copy-note" id="encodeError"></div>
+      </section>
+
+      <!-- JSON整形 -->
+      <section class="tool-card" id="tool-json" style="display:none;">
+        <h1>JSON整形</h1>
+        <p class="lead">JSONを読みやすく整形します。壊れている場合はエラー箇所を表示します。</p>
+        <div class="field">
+          <label>入力</label>
+          <textarea id="jsonInput" placeholder='{"name":"太郎","age":20}' style="min-height:120px;"></textarea>
+        </div>
+        <div class="row" style="margin-bottom:14px;">
+          <button type="button" class="btn" id="jsonFormatBtn">整形する</button>
+          <button type="button" class="btn secondary" id="jsonMinifyBtn">1行に圧縮</button>
+        </div>
+        <div class="field">
+          <label>結果</label>
+          <textarea id="jsonOutput" readonly style="min-height:160px; font-family:'SF Mono', Consolas, monospace;"></textarea>
+        </div>
+        <div class="copy-note" id="jsonError"></div>
+      </section>
+
+      <!-- タイマー / ストップウォッチ -->
+      <section class="tool-card" id="tool-timer" style="display:none;">
+        <h1>タイマー / ストップウォッチ</h1>
+        <p class="lead">シンプルなカウントダウンタイマーとストップウォッチです。</p>
+        <div class="row" style="margin-bottom:10px;">
+          <button type="button" class="btn secondary" data-timer-tab="countdown">カウントダウン</button>
+          <button type="button" class="btn secondary" data-timer-tab="stopwatch">ストップウォッチ</button>
+        </div>
+        <div id="timerCountdownBox">
+          <div class="row">
+            <div class="field"><label>分</label><input type="number" id="timerMinutes" value="5" min="0"></div>
+            <div class="field"><label>秒</label><input type="number" id="timerSeconds" value="0" min="0" max="59"></div>
+          </div>
+          <div class="stat-box" style="text-align:center; padding:22px; margin-bottom:14px;">
+            <div class="num" id="timerDisplay" style="font-size:36px; font-family:'SF Mono', Consolas, monospace;">05:00</div>
+          </div>
+          <div class="row">
+            <button type="button" class="btn" id="timerStartBtn">開始</button>
+            <button type="button" class="btn secondary" id="timerStopBtn">停止</button>
+            <button type="button" class="btn secondary" id="timerResetBtn">リセット</button>
+          </div>
+        </div>
+        <div id="timerStopwatchBox" style="display:none;">
+          <div class="stat-box" style="text-align:center; padding:22px; margin-bottom:14px;">
+            <div class="num" id="stopwatchDisplay" style="font-size:36px; font-family:'SF Mono', Consolas, monospace;">00:00.0</div>
+          </div>
+          <div class="row">
+            <button type="button" class="btn" id="stopwatchStartBtn">開始</button>
+            <button type="button" class="btn secondary" id="stopwatchStopBtn">停止</button>
+            <button type="button" class="btn secondary" id="stopwatchResetBtn">リセット</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 消費税計算 -->
+      <section class="tool-card" id="tool-tax" style="display:none;">
+        <h1>消費税計算</h1>
+        <p class="lead">税抜き・税込み価格を相互に計算します。</p>
+        <div class="row">
+          <div class="field"><label>金額</label><input type="number" id="taxAmount" value="1000"></div>
+          <div class="field"><label>税率(%)</label><input type="number" id="taxRate" value="10"></div>
+        </div>
+        <div class="stat-grid">
+          <div class="stat-box"><div class="num" id="taxIncluded">-</div><div class="label">税込み(入力を税抜きとして)</div></div>
+          <div class="stat-box"><div class="num" id="taxExcluded">-</div><div class="label">税抜き(入力を税込みとして)</div></div>
+          <div class="stat-box"><div class="num" id="taxOnly">-</div><div class="label">消費税額</div></div>
+        </div>
+      </section>
+
+      <!-- BMI計算 -->
+      <section class="tool-card" id="tool-bmi" style="display:none;">
+        <h1>BMI計算</h1>
+        <p class="lead">身長と体重からBMIと判定を計算します。</p>
+        <div class="row">
+          <div class="field"><label>身長 (cm)</label><input type="number" id="bmiHeight" value="170"></div>
+          <div class="field"><label>体重 (kg)</label><input type="number" id="bmiWeight" value="60"></div>
+        </div>
+        <div class="stat-box" style="text-align:center; padding:20px;">
+          <div class="num" id="bmiResult" style="font-size:28px;">-</div>
+          <div class="label" id="bmiJudge">身長と体重を入力してください</div>
+        </div>
+      </section>
+
+      <!-- 割り勘計算 -->
+      <section class="tool-card" id="tool-split" style="display:none;">
+        <h1>割り勘計算</h1>
+        <p class="lead">合計金額を人数で割ります。端数の扱いも選べます。</p>
+        <div class="row">
+          <div class="field"><label>合計金額(円)</label><input type="number" id="splitTotal" value="10000"></div>
+          <div class="field"><label>人数</label><input type="number" id="splitPeople" value="3" min="1"></div>
+          <div class="field">
+            <label>端数の扱い</label>
+            <select id="splitRounding">
+              <option value="ceil">切り上げ</option>
+              <option value="floor">切り捨て</option>
+              <option value="round">四捨五入</option>
+            </select>
+          </div>
+        </div>
+        <div class="stat-grid">
+          <div class="stat-box"><div class="num" id="splitPerPerson">-</div><div class="label">1人あたり</div></div>
+          <div class="stat-box"><div class="num" id="splitTotalRounded">-</div><div class="label">合計(端数調整後)</div></div>
+        </div>
+      </section>
+
+      <!-- 乱数 / サイコロ -->
+      <section class="tool-card" id="tool-random" style="display:none;">
+        <h1>乱数 / サイコロ</h1>
+        <p class="lead">指定範囲の乱数や、サイコロ・くじ引きに使えます。</p>
+        <div class="row">
+          <div class="field"><label>最小値</label><input type="number" id="randomMin" value="1"></div>
+          <div class="field"><label>最大値</label><input type="number" id="randomMax" value="6"></div>
+        </div>
+        <div class="stat-box" style="text-align:center; padding:22px; margin-bottom:14px;">
+          <div class="num" id="randomResult" style="font-size:36px;">-</div>
+        </div>
+        <button type="button" class="btn" id="randomBtn">乱数を生成</button>
+
+        <div style="margin-top:24px;">
+          <label>くじ引き(候補を1行に1つずつ)</label>
+          <textarea id="lotteryInput" placeholder="Aさん&#10;Bさん&#10;Cさん" style="min-height:80px;"></textarea>
+          <button type="button" class="btn secondary" id="lotteryBtn" style="margin-top:10px;">1つ選ぶ</button>
+          <div class="stat-box" style="text-align:center; padding:16px; margin-top:10px;" id="lotteryResultBox">
+            <div class="num" id="lotteryResult">-</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 文字列ケース変換 -->
+      <section class="tool-card" id="tool-case" style="display:none;">
+        <h1>文字列ケース変換</h1>
+        <p class="lead">大文字/小文字/キャメルケース/スネークケースなどに変換します。</p>
+        <div class="field">
+          <label>入力</label>
+          <textarea id="caseInput" placeholder="hello world"></textarea>
+        </div>
+        <div class="row" style="margin-bottom:14px;">
+          <button type="button" class="btn" data-case-action="upper">UPPERCASE</button>
+          <button type="button" class="btn secondary" data-case-action="lower">lowercase</button>
+          <button type="button" class="btn" data-case-action="title">Title Case</button>
+          <button type="button" class="btn secondary" data-case-action="camel">camelCase</button>
+          <button type="button" class="btn" data-case-action="snake">snake_case</button>
+          <button type="button" class="btn secondary" data-case-action="kebab">kebab-case</button>
+        </div>
+        <div class="field">
+          <label>結果</label>
+          <textarea id="caseOutput" readonly></textarea>
+        </div>
+      </section>
+
+      <!-- ハッシュ生成 -->
+      <section class="tool-card" id="tool-hash" style="display:none;">
+        <h1>ハッシュ生成</h1>
+        <p class="lead">SHA-1 / SHA-256 / SHA-512 のハッシュ値を計算します(ブラウザ標準のWeb Crypto APIを使用)。</p>
+        <div class="field">
+          <label>入力</label>
+          <textarea id="hashInput" placeholder="ハッシュ化したいテキスト"></textarea>
+        </div>
+        <div class="field">
+          <label>SHA-1</label>
+          <input type="text" id="hashSha1" readonly style="font-family:'SF Mono', Consolas, monospace; font-size:12px;">
+        </div>
+        <div class="field">
+          <label>SHA-256</label>
+          <input type="text" id="hashSha256" readonly style="font-family:'SF Mono', Consolas, monospace; font-size:12px;">
+        </div>
+        <div class="field">
+          <label>SHA-512</label>
+          <input type="text" id="hashSha512" readonly style="font-family:'SF Mono', Consolas, monospace; font-size:12px;">
+        </div>
+      </section>
+
+      <!-- トークン発行 -->
+      <section class="tool-card" id="tool-token" style="display:none;">
+        <h1>APIアクセストークン発行</h1>
+        <p class="lead">当サイトのAPIにアクセスするためのトークンを発行します(有効期限1日)。サーバー側の秘密鍵で署名しているので、他所で同じ形式の文字列を偽造することはできません。</p>
+        <button type="button" class="btn" id="tokenIssueBtn">トークンを発行する</button>
+        <div class="field" style="margin-top:16px;">
+          <label>発行されたトークン</label>
+          <textarea id="tokenOutput" readonly style="min-height:70px; font-family:'SF Mono', Consolas, monospace; font-size:12px;"></textarea>
+        </div>
+        <div class="stat-grid" id="tokenInfoGrid" style="display:none;">
+          <div class="stat-box"><div class="num" id="tokenIssuedAt">-</div><div class="label">発行日時</div></div>
+          <div class="stat-box"><div class="num" id="tokenExpiresAt">-</div><div class="label">有効期限</div></div>
+        </div>
+
+        <div style="margin-top:24px;">
+          <label>トークンを検証する</label>
+          <textarea id="tokenVerifyInput" placeholder="検証したいトークンを貼り付け" style="min-height:60px;"></textarea>
+          <button type="button" class="btn secondary" id="tokenVerifyBtn" style="margin-top:10px;">検証する</button>
+          <div class="copy-note" id="tokenVerifyResult"></div>
+        </div>
+
+        <div class="usage-box">
+          <h2>使い方</h2>
+          <p>発行したトークンは、APIへのリクエストに以下のいずれかの方法で付けてください。トークンが無い/期限切れの場合、対象のエンドポイントは見つからない扱い(404)になります。</p>
+          <div class="usage-method">
+            <div class="usage-method-title">方法1: HTTPヘッダーに付ける(推奨)</div>
+            <pre id="usageCurlHeader">curl -H "X-API-Token: (ここにトークン)" https://(このサイトのドメイン)/api/health</pre>
+          </div>
+          <div class="usage-method">
+            <div class="usage-method-title">方法2: クエリパラメータに付ける</div>
+            <pre id="usageCurlQuery">curl "https://(このサイトのドメイン)/api/health?token=(ここにトークン)"</pre>
+          </div>
+          <p class="usage-note">トークンを発行すると、上の例は自動的にあなたのトークンで置き換わります。</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+
+  <footer>&copy; ちょいツール</footer>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script>
+    // ---------- ツール切り替え ----------
+    document.querySelectorAll("#toolNav button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll("#toolNav button").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        document.querySelectorAll(".tool-card").forEach((s) => { s.style.display = "none"; });
+        document.getElementById("tool-" + btn.dataset.tool).style.display = "block";
+      });
+    });
+
+    // ---------- QRコード生成 ----------
+    const qrCanvasBox = document.getElementById("qrcodeCanvas");
+    const qrEmptyHint = document.getElementById("qrEmptyHint");
+    const qrDownloadBtn = document.getElementById("qrDownloadBtn");
+    function renderQr() {
+      const text = document.getElementById("qrText").value.trim();
+      qrCanvasBox.innerHTML = "";
+      if (!text) {
+        qrEmptyHint.style.display = "block";
+        qrDownloadBtn.style.display = "none";
+        return;
+      }
+      qrEmptyHint.style.display = "none";
+      const size = parseInt(document.getElementById("qrSize").value, 10);
+      new QRCode(qrCanvasBox, { text, width: size, height: size, correctLevel: QRCode.CorrectLevel.M });
+      setTimeout(() => {
+        const img = qrCanvasBox.querySelector("img");
+        const canvas = qrCanvasBox.querySelector("canvas");
+        const dataUrl = img && img.src ? img.src : (canvas ? canvas.toDataURL("image/png") : null);
+        if (dataUrl) {
+          qrDownloadBtn.href = dataUrl;
+          qrDownloadBtn.download = "qrcode.png";
+          qrDownloadBtn.style.display = "inline-block";
+        }
+      }, 80);
+    }
+    document.getElementById("qrText").addEventListener("input", renderQr);
+    document.getElementById("qrSize").addEventListener("change", renderQr);
+
+    // ---------- 文字数カウント ----------
+    function renderCount() {
+      const text = document.getElementById("countText").value;
+      document.getElementById("countChars").textContent = text.length;
+      document.getElementById("countNoSpace").textContent = text.replace(/\s/g, "").length;
+      document.getElementById("countLines").textContent = text === "" ? 0 : text.split("\n").length;
+      const words = text.trim().split(/\s+/).filter(Boolean);
+      document.getElementById("countWords").textContent = text.trim() === "" ? 0 : words.length;
+    }
+    document.getElementById("countText").addEventListener("input", renderCount);
+
+    // ---------- パスワード生成 ----------
+    function generatePassword() {
+      const length = parseInt(document.getElementById("pwLength").value, 10);
+      let chars = "";
+      if (document.getElementById("pwUpper").checked) chars += "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+      if (document.getElementById("pwLower").checked) chars += "abcdefghijklmnopqrstuvwxyz";
+      if (document.getElementById("pwDigits").checked) chars += "0123456789";
+      if (document.getElementById("pwSymbols").checked) chars += "!@#$%^&*()-_=+[]{}";
+      if (!chars) {
+        document.getElementById("pwOutput").textContent = "(文字種類を1つ以上選んでください)";
+        return;
+      }
+      const randomValues = new Uint32Array(length);
+      crypto.getRandomValues(randomValues);
+      let result = "";
+      for (let i = 0; i < length; i++) result += chars[randomValues[i] % chars.length];
+      document.getElementById("pwOutput").textContent = result;
+    }
+    document.getElementById("pwLength").addEventListener("input", (e) => {
+      document.getElementById("pwLengthLabel").textContent = e.target.value;
+      generatePassword();
+    });
+    ["pwUpper", "pwLower", "pwDigits", "pwSymbols"].forEach((id) => {
+      document.getElementById(id).addEventListener("change", generatePassword);
+    });
+    document.getElementById("pwRegenBtn").addEventListener("click", generatePassword);
+    document.getElementById("pwCopyBtn").addEventListener("click", async () => {
+      const text = document.getElementById("pwOutput").textContent;
+      const note = document.getElementById("pwCopyNote");
+      try {
+        await navigator.clipboard.writeText(text);
+        note.textContent = "コピーしました";
+        setTimeout(() => { note.textContent = ""; }, 1800);
+      } catch (e) {
+        note.textContent = "コピーできませんでした";
+      }
+    });
+    generatePassword();
+
+    // ---------- 単位変換 ----------
+    const UNIT_DEFS = {
+      length: { m: 1, km: 1000, cm: 0.01, mm: 0.001, mile: 1609.344, yard: 0.9144, feet: 0.3048, inch: 0.0254 },
+      weight: { kg: 1, g: 0.001, mg: 0.000001, t: 1000, lb: 0.453592, oz: 0.0283495 },
+    };
+    function populateUnitSelects() {
+      const category = document.getElementById("unitCategory").value;
+      const fromSel = document.getElementById("unitFrom");
+      const toSel = document.getElementById("unitTo");
+      fromSel.innerHTML = ""; toSel.innerHTML = "";
+      if (category === "temperature") {
+        ["celsius", "fahrenheit", "kelvin"].forEach((u) => {
+          fromSel.add(new Option(u, u));
+          toSel.add(new Option(u, u));
+        });
+        toSel.selectedIndex = 1;
+      } else {
+        Object.keys(UNIT_DEFS[category]).forEach((u) => {
+          fromSel.add(new Option(u, u));
+          toSel.add(new Option(u, u));
+        });
+        toSel.selectedIndex = 1;
+      }
+      renderUnitResult();
+    }
+    function convertTemperature(value, from, to) {
+      let celsius;
+      if (from === "celsius") celsius = value;
+      else if (from === "fahrenheit") celsius = (value - 32) * 5 / 9;
+      else celsius = value - 273.15;
+      if (to === "celsius") return celsius;
+      if (to === "fahrenheit") return celsius * 9 / 5 + 32;
+      return celsius + 273.15;
+    }
+    function renderUnitResult() {
+      const category = document.getElementById("unitCategory").value;
+      const value = parseFloat(document.getElementById("unitInputValue").value);
+      const from = document.getElementById("unitFrom").value;
+      const to = document.getElementById("unitTo").value;
+      if (isNaN(value)) { document.getElementById("unitResult").textContent = "-"; return; }
+      let result;
+      if (category === "temperature") {
+        result = convertTemperature(value, from, to);
+      } else {
+        const defs = UNIT_DEFS[category];
+        result = value * defs[from] / defs[to];
+      }
+      document.getElementById("unitResult").textContent = `${(Math.round(result * 100000) / 100000)} ${to}`;
+    }
+    document.getElementById("unitCategory").addEventListener("change", populateUnitSelects);
+    document.getElementById("unitInputValue").addEventListener("input", renderUnitResult);
+    document.getElementById("unitFrom").addEventListener("change", renderUnitResult);
+    document.getElementById("unitTo").addEventListener("change", renderUnitResult);
+    populateUnitSelects();
+
+    // ---------- カラーコード変換 ----------
+    function hexToRgb(hex) {
+      const m = hex.replace("#", "").match(/^([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
+      if (!m) return null;
+      return { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) };
+    }
+    function rgbToHex(r, g, b) {
+      const clamp = (n) => Math.max(0, Math.min(255, Math.round(n)));
+      return "#" + [r, g, b].map((n) => clamp(n).toString(16).padStart(2, "0")).join("");
+    }
+    function rgbToHsl(r, g, b) {
+      r /= 255; g /= 255; b /= 255;
+      const max = Math.max(r, g, b), min = Math.min(r, g, b);
+      let h, s, l = (max + min) / 2;
+      if (max === min) { h = s = 0; }
+      else {
+        const d = max - min;
+        s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+        if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+        else if (max === g) h = (b - r) / d + 2;
+        else h = (r - g) / d + 4;
+        h /= 6;
+      }
+      return { h: Math.round(h * 360), s: Math.round(s * 100), l: Math.round(l * 100) };
+    }
+    function updateColorFromRgb(r, g, b) {
+      const hex = rgbToHex(r, g, b);
+      const hsl = rgbToHsl(r, g, b);
+      document.getElementById("colorHex").value = hex;
+      document.getElementById("colorPicker").value = hex;
+      document.getElementById("colorR").value = Math.round(r);
+      document.getElementById("colorG").value = Math.round(g);
+      document.getElementById("colorB").value = Math.round(b);
+      document.getElementById("colorHsl").value = `hsl(${hsl.h}, ${hsl.s}%, ${hsl.l}%)`;
+      document.getElementById("colorPreview").style.background = hex;
+    }
+    document.getElementById("colorPicker").addEventListener("input", (e) => {
+      const rgb = hexToRgb(e.target.value);
+      if (rgb) updateColorFromRgb(rgb.r, rgb.g, rgb.b);
+    });
+    document.getElementById("colorHex").addEventListener("input", (e) => {
+      const rgb = hexToRgb(e.target.value);
+      if (rgb) updateColorFromRgb(rgb.r, rgb.g, rgb.b);
+    });
+    ["colorR", "colorG", "colorB"].forEach((id) => {
+      document.getElementById(id).addEventListener("input", () => {
+        updateColorFromRgb(
+          parseFloat(document.getElementById("colorR").value) || 0,
+          parseFloat(document.getElementById("colorG").value) || 0,
+          parseFloat(document.getElementById("colorB").value) || 0
+        );
+      });
+    });
+    updateColorFromRgb(45, 106, 79);
+
+    // ---------- Base64 / URLエンコード ----------
+    function utf8ToBase64(str) { return btoa(unescape(encodeURIComponent(str))); }
+    function base64ToUtf8(str) { return decodeURIComponent(escape(atob(str))); }
+    document.querySelectorAll("[data-encode-action]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const input = document.getElementById("encodeInput").value;
+        const errorBox = document.getElementById("encodeError");
+        const outputBox = document.getElementById("encodeOutput");
+        errorBox.textContent = "";
+        try {
+          const action = btn.dataset.encodeAction;
+          if (action === "base64encode") outputBox.value = utf8ToBase64(input);
+          else if (action === "base64decode") outputBox.value = base64ToUtf8(input);
+          else if (action === "urlencode") outputBox.value = encodeURIComponent(input);
+          else if (action === "urldecode") outputBox.value = decodeURIComponent(input);
+        } catch (e) {
+          errorBox.textContent = "変換に失敗しました(入力形式を確認してください)";
+        }
+      });
+    });
+
+    // ---------- JSON整形 ----------
+    document.getElementById("jsonFormatBtn").addEventListener("click", () => {
+      const errorBox = document.getElementById("jsonError");
+      errorBox.textContent = "";
+      try {
+        const parsed = JSON.parse(document.getElementById("jsonInput").value);
+        document.getElementById("jsonOutput").value = JSON.stringify(parsed, null, 2);
+      } catch (e) {
+        errorBox.textContent = "JSONの形式が正しくありません: " + e.message;
+        document.getElementById("jsonOutput").value = "";
+      }
+    });
+    document.getElementById("jsonMinifyBtn").addEventListener("click", () => {
+      const errorBox = document.getElementById("jsonError");
+      errorBox.textContent = "";
+      try {
+        const parsed = JSON.parse(document.getElementById("jsonInput").value);
+        document.getElementById("jsonOutput").value = JSON.stringify(parsed);
+      } catch (e) {
+        errorBox.textContent = "JSONの形式が正しくありません: " + e.message;
+        document.getElementById("jsonOutput").value = "";
+      }
+    });
+
+    // ---------- タイマー / ストップウォッチ ----------
+    document.querySelectorAll("[data-timer-tab]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const tab = btn.dataset.timerTab;
+        document.getElementById("timerCountdownBox").style.display = tab === "countdown" ? "block" : "none";
+        document.getElementById("timerStopwatchBox").style.display = tab === "stopwatch" ? "block" : "none";
+      });
+    });
+    let countdownRemaining = 5 * 60;
+    let countdownIntervalId = null;
+    function formatCountdown(totalSeconds) {
+      const m = Math.floor(totalSeconds / 60).toString().padStart(2, "0");
+      const s = Math.floor(totalSeconds % 60).toString().padStart(2, "0");
+      return `${m}:${s}`;
+    }
+    function renderCountdownDisplay() {
+      document.getElementById("timerDisplay").textContent = formatCountdown(Math.max(0, countdownRemaining));
+    }
+    document.getElementById("timerStartBtn").addEventListener("click", () => {
+      if (countdownIntervalId) return;
+      if (countdownRemaining <= 0) {
+        countdownRemaining = (parseInt(document.getElementById("timerMinutes").value, 10) || 0) * 60
+          + (parseInt(document.getElementById("timerSeconds").value, 10) || 0);
+      }
+      countdownIntervalId = setInterval(() => {
+        countdownRemaining -= 1;
+        renderCountdownDisplay();
+        if (countdownRemaining <= 0) {
+          clearInterval(countdownIntervalId);
+          countdownIntervalId = null;
+        }
+      }, 1000);
+    });
+    document.getElementById("timerStopBtn").addEventListener("click", () => {
+      clearInterval(countdownIntervalId);
+      countdownIntervalId = null;
+    });
+    document.getElementById("timerResetBtn").addEventListener("click", () => {
+      clearInterval(countdownIntervalId);
+      countdownIntervalId = null;
+      countdownRemaining = (parseInt(document.getElementById("timerMinutes").value, 10) || 0) * 60
+        + (parseInt(document.getElementById("timerSeconds").value, 10) || 0);
+      renderCountdownDisplay();
+    });
+    ["timerMinutes", "timerSeconds"].forEach((id) => {
+      document.getElementById(id).addEventListener("input", () => {
+        if (!countdownIntervalId) {
+          countdownRemaining = (parseInt(document.getElementById("timerMinutes").value, 10) || 0) * 60
+            + (parseInt(document.getElementById("timerSeconds").value, 10) || 0);
+          renderCountdownDisplay();
+        }
+      });
+    });
+
+    let stopwatchStartedAt = null;
+    let stopwatchElapsed = 0;
+    let stopwatchIntervalId = null;
+    function formatStopwatch(ms) {
+      const totalTenths = Math.floor(ms / 100);
+      const m = Math.floor(totalTenths / 600).toString().padStart(2, "0");
+      const s = Math.floor((totalTenths % 600) / 10).toString().padStart(2, "0");
+      const t = (totalTenths % 10).toString();
+      return `${m}:${s}.${t}`;
+    }
+    function renderStopwatch() {
+      const current = stopwatchElapsed + (stopwatchStartedAt ? Date.now() - stopwatchStartedAt : 0);
+      document.getElementById("stopwatchDisplay").textContent = formatStopwatch(current);
+    }
+    document.getElementById("stopwatchStartBtn").addEventListener("click", () => {
+      if (stopwatchIntervalId) return;
+      stopwatchStartedAt = Date.now();
+      stopwatchIntervalId = setInterval(renderStopwatch, 100);
+    });
+    document.getElementById("stopwatchStopBtn").addEventListener("click", () => {
+      if (!stopwatchIntervalId) return;
+      stopwatchElapsed += Date.now() - stopwatchStartedAt;
+      stopwatchStartedAt = null;
+      clearInterval(stopwatchIntervalId);
+      stopwatchIntervalId = null;
+    });
+    document.getElementById("stopwatchResetBtn").addEventListener("click", () => {
+      clearInterval(stopwatchIntervalId);
+      stopwatchIntervalId = null;
+      stopwatchStartedAt = null;
+      stopwatchElapsed = 0;
+      renderStopwatch();
+    });
+
+    // ---------- 消費税計算 ----------
+    function renderTax() {
+      const amount = parseFloat(document.getElementById("taxAmount").value);
+      const rate = parseFloat(document.getElementById("taxRate").value);
+      if (isNaN(amount) || isNaN(rate)) return;
+      const included = Math.round(amount * (1 + rate / 100));
+      const excluded = Math.round(amount / (1 + rate / 100));
+      document.getElementById("taxIncluded").textContent = included.toLocaleString() + "円";
+      document.getElementById("taxExcluded").textContent = excluded.toLocaleString() + "円";
+      document.getElementById("taxOnly").textContent = Math.round(amount * rate / 100).toLocaleString() + "円";
+    }
+    document.getElementById("taxAmount").addEventListener("input", renderTax);
+    document.getElementById("taxRate").addEventListener("input", renderTax);
+    renderTax();
+
+    // ---------- BMI計算 ----------
+    function renderBmi() {
+      const heightCm = parseFloat(document.getElementById("bmiHeight").value);
+      const weightKg = parseFloat(document.getElementById("bmiWeight").value);
+      if (!heightCm || !weightKg) return;
+      const heightM = heightCm / 100;
+      const bmi = weightKg / (heightM * heightM);
+      document.getElementById("bmiResult").textContent = bmi.toFixed(1);
+      let judge;
+      if (bmi < 18.5) judge = "低体重(やせ型)";
+      else if (bmi < 25) judge = "普通体重";
+      else if (bmi < 30) judge = "肥満(1度)";
+      else judge = "肥満(2度以上)";
+      document.getElementById("bmiJudge").textContent = judge + "(日本肥満学会の基準)";
+    }
+    document.getElementById("bmiHeight").addEventListener("input", renderBmi);
+    document.getElementById("bmiWeight").addEventListener("input", renderBmi);
+    renderBmi();
+
+    // ---------- 割り勘計算 ----------
+    function renderSplit() {
+      const total = parseFloat(document.getElementById("splitTotal").value);
+      const people = parseInt(document.getElementById("splitPeople").value, 10);
+      const mode = document.getElementById("splitRounding").value;
+      if (!total || !people) return;
+      const raw = total / people;
+      let perPerson;
+      if (mode === "ceil") perPerson = Math.ceil(raw);
+      else if (mode === "floor") perPerson = Math.floor(raw);
+      else perPerson = Math.round(raw);
+      document.getElementById("splitPerPerson").textContent = perPerson.toLocaleString() + "円";
+      document.getElementById("splitTotalRounded").textContent = (perPerson * people).toLocaleString() + "円";
+    }
+    document.getElementById("splitTotal").addEventListener("input", renderSplit);
+    document.getElementById("splitPeople").addEventListener("input", renderSplit);
+    document.getElementById("splitRounding").addEventListener("change", renderSplit);
+    renderSplit();
+
+    // ---------- 乱数 / サイコロ ----------
+    document.getElementById("randomBtn").addEventListener("click", () => {
+      const min = parseInt(document.getElementById("randomMin").value, 10);
+      const max = parseInt(document.getElementById("randomMax").value, 10);
+      if (isNaN(min) || isNaN(max) || min > max) {
+        document.getElementById("randomResult").textContent = "範囲が不正です";
+        return;
+      }
+      const range = max - min + 1;
+      const buf = new Uint32Array(1);
+      crypto.getRandomValues(buf);
+      document.getElementById("randomResult").textContent = (min + (buf[0] % range)).toString();
+    });
+    document.getElementById("lotteryBtn").addEventListener("click", () => {
+      const lines = document.getElementById("lotteryInput").value.split("\n").map((s) => s.trim()).filter(Boolean);
+      if (!lines.length) {
+        document.getElementById("lotteryResult").textContent = "候補を入力してください";
+        return;
+      }
+      const buf = new Uint32Array(1);
+      crypto.getRandomValues(buf);
+      document.getElementById("lotteryResult").textContent = lines[buf[0] % lines.length];
+    });
+
+    // ---------- 文字列ケース変換 ----------
+    function toWords(str) {
+      return str
+        .replace(/([a-z])([A-Z])/g, "$1 $2")
+        .replace(/[_-]+/g, " ")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((w) => w.toLowerCase());
+    }
+    document.querySelectorAll("[data-case-action]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const input = document.getElementById("caseInput").value;
+        const words = toWords(input);
+        const action = btn.dataset.caseAction;
+        let result;
+        if (action === "upper") result = input.toUpperCase();
+        else if (action === "lower") result = input.toLowerCase();
+        else if (action === "title") result = words.map((w) => w[0].toUpperCase() + w.slice(1)).join(" ");
+        else if (action === "camel") result = words.map((w, i) => i === 0 ? w : w[0].toUpperCase() + w.slice(1)).join("");
+        else if (action === "snake") result = words.join("_");
+        else if (action === "kebab") result = words.join("-");
+        document.getElementById("caseOutput").value = result || "";
+      });
+    });
+
+    // ---------- ハッシュ生成 ----------
+    async function computeHash(algorithm, text) {
+      const data = new TextEncoder().encode(text);
+      const digest = await crypto.subtle.digest(algorithm, data);
+      return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+    async function renderHashes() {
+      const text = document.getElementById("hashInput").value;
+      if (!text) {
+        document.getElementById("hashSha1").value = "";
+        document.getElementById("hashSha256").value = "";
+        document.getElementById("hashSha512").value = "";
+        return;
+      }
+      document.getElementById("hashSha1").value = await computeHash("SHA-1", text);
+      document.getElementById("hashSha256").value = await computeHash("SHA-256", text);
+      document.getElementById("hashSha512").value = await computeHash("SHA-512", text);
+    }
+    document.getElementById("hashInput").addEventListener("input", renderHashes);
+
+    // ---------- トークン発行 ----------
+    function formatDateTime(unixSeconds) {
+      const d = new Date(unixSeconds * 1000);
+      return d.toLocaleString("ja-JP");
+    }
+    document.getElementById("tokenIssueBtn").addEventListener("click", async () => {
+      const btn = document.getElementById("tokenIssueBtn");
+      btn.disabled = true;
+      try {
+        const res = await fetch("/api/token/issue");
+        const data = await res.json();
+        document.getElementById("tokenOutput").value = data.token;
+        document.getElementById("tokenIssuedAt").textContent = formatDateTime(data.issued_at);
+        document.getElementById("tokenExpiresAt").textContent = formatDateTime(data.expires_at);
+        document.getElementById("tokenInfoGrid").style.display = "grid";
+        const origin = window.location.origin;
+        document.getElementById("usageCurlHeader").textContent = `curl -H "X-API-Token: ${data.token}" ${origin}/api/health`;
+        document.getElementById("usageCurlQuery").textContent = `curl "${origin}/api/health?token=${data.token}"`;
+      } catch (e) {
+        document.getElementById("tokenOutput").value = "発行に失敗しました。時間をおいて再度お試しください。";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    document.getElementById("tokenVerifyBtn").addEventListener("click", async () => {
+      const token = document.getElementById("tokenVerifyInput").value.trim();
+      const resultBox = document.getElementById("tokenVerifyResult");
+      if (!token) {
+        resultBox.textContent = "トークンを入力してください";
+        return;
+      }
+      try {
+        const res = await fetch(`/api/token/verify?token=${encodeURIComponent(token)}`);
+        const data = await res.json();
+        if (data.valid) {
+          const remainH = Math.floor(data.expires_in_seconds / 3600);
+          const remainM = Math.floor((data.expires_in_seconds % 3600) / 60);
+          resultBox.textContent = `有効です(残り約${remainH}時間${remainM}分)`;
+        } else if (data.reason === "expired") {
+          resultBox.textContent = "このトークンは期限切れです";
+        } else {
+          resultBox.textContent = "無効なトークンです";
+        }
+      } catch (e) {
+        resultBox.textContent = "検証に失敗しました";
+      }
+    });
+  </script>
+</body>
+</html>
