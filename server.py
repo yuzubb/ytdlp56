@@ -276,7 +276,7 @@ def _enforce_ip_ban():
 
     if ip_ban or email_ban:
         log("denied", f"BAN済みアクセスを拒否: ip={client_ip} email={email} -> {path}", "red")
-        raise ApiError(403, "利用を制限されています。お問い合わせフォームからご連絡ください。")
+        raise ApiError(403, "利用を制限されています。お問い合わせフォームからご連絡ください。", code="MODERATION_BANNED")
     return None
 
 
@@ -319,7 +319,7 @@ def _enforce_api_token():
 def _require_admin_password():
     supplied = request.args.get("password", "")
     if supplied != ADMIN_PASSWORD:
-        raise ApiError(403, "invalid password")
+        raise ApiError(403, "invalid password", code="AUTH_INVALID_ADMIN_PASSWORD")
 
 
 
@@ -383,23 +383,23 @@ _AVATAR_MAX_BYTES = 50 * 1024
 def _validate_display_name(name):
     name = (name or "").strip()
     if not name:
-        raise ApiError(400, "表示名を入力してください")
+        raise ApiError(400, "表示名を入力してください", code="VALIDATION_DISPLAY_NAME_REQUIRED")
     if len(name) > _DISPLAY_NAME_MAX_LEN:
-        raise ApiError(400, f"表示名は{_DISPLAY_NAME_MAX_LEN}文字以内にしてください")
+        raise ApiError(400, f"表示名は{_DISPLAY_NAME_MAX_LEN}文字以内にしてください", code="VALIDATION_DISPLAY_NAME_TOO_LONG")
     if _DANGEROUS_CHARS_RE.search(name):
-        raise ApiError(400, "表示名に使えない文字が含まれています(< > \" ' & は使えません)")
+        raise ApiError(400, "表示名に使えない文字が含まれています(< > \" ' & は使えません)", code="VALIDATION_DISPLAY_NAME_INVALID_CHARS")
     return name
 
 
 def _validate_user_id(user_id, users, current_email):
     user_id = (user_id or "").strip().lower()
     if not user_id:
-        raise ApiError(400, "ユーザーIDを入力してください")
+        raise ApiError(400, "ユーザーIDを入力してください", code="VALIDATION_USER_ID_REQUIRED")
     if not _USER_ID_RE.match(user_id):
-        raise ApiError(400, "ユーザーIDは英数字とアンダースコアのみ、3〜20文字にしてください")
+        raise ApiError(400, "ユーザーIDは英数字とアンダースコアのみ、3〜20文字にしてください", code="VALIDATION_USER_ID_INVALID_FORMAT")
     for other_email, other_user in users.items():
         if other_email != current_email and other_user.get("user_id") == user_id:
-            raise ApiError(409, "このユーザーIDは既に使われています")
+            raise ApiError(409, "このユーザーIDは既に使われています", code="CONFLICT_USER_ID_TAKEN")
     return user_id
 
 
@@ -413,17 +413,17 @@ def _validate_and_process_avatar(avatar_base64):
     if not avatar_base64:
         return None
     if not avatar_base64.startswith("data:image/"):
-        raise ApiError(400, "アイコンの形式が正しくありません")
+        raise ApiError(400, "アイコンの形式が正しくありません", code="VALIDATION_AVATAR_INVALID_FORMAT")
     try:
         header, b64_data = avatar_base64.split(",", 1)
     except ValueError:
-        raise ApiError(400, "アイコンの形式が正しくありません")
+        raise ApiError(400, "アイコンの形式が正しくありません", code="VALIDATION_AVATAR_INVALID_FORMAT")
     try:
         raw = base64.b64decode(b64_data)
     except (ValueError, binascii.Error):
-        raise ApiError(400, "アイコンのデータが壊れています")
+        raise ApiError(400, "アイコンのデータが壊れています", code="VALIDATION_AVATAR_CORRUPTED")
     if len(raw) > _AVATAR_MAX_BYTES:
-        raise ApiError(400, f"アイコンは{_AVATAR_MAX_BYTES // 1024}KB以内にしてください")
+        raise ApiError(400, f"アイコンは{_AVATAR_MAX_BYTES // 1024}KB以内にしてください", code="VALIDATION_AVATAR_TOO_LARGE")
     try:
         from PIL import Image
         import io
@@ -432,9 +432,9 @@ def _validate_and_process_avatar(avatar_base64):
         img = Image.open(io.BytesIO(raw))  # verify後は再オープンが必要
         width, height = img.size
     except Exception:
-        raise ApiError(400, "アイコンの画像を読み込めませんでした")
+        raise ApiError(400, "アイコンの画像を読み込めませんでした", code="VALIDATION_AVATAR_UNREADABLE")
     if width != height:
-        raise ApiError(400, f"アイコンは正方形の画像にしてください(現在: {width}x{height})")
+        raise ApiError(400, f"アイコンは正方形の画像にしてください(現在: {width}x{height})", code="VALIDATION_AVATAR_NOT_SQUARE")
     return avatar_base64
 
 # ---------- 表向きサイト用のトークン発行ツール ----------
@@ -476,7 +476,7 @@ def token_issue():
 def token_verify():
     token = request.args.get("token", "")
     if not token:
-        raise ApiError(400, "token parameter is required")
+        raise ApiError(400, "token parameter is required", code="VALIDATION_TOKEN_REQUIRED")
     return jsonify(_verify_public_token(token))
 
 
@@ -516,18 +516,18 @@ def auth_signup():
     if _is_ip_banned(client_ip) or _is_email_banned(email):
         # BAN逃れのための新規アカウント作成を防ぐ。理由は詳しく教えない
         # (BANされていること自体は伝えるが、どちらの判定で弾かれたかは教えない)。
-        raise ApiError(403, "アカウントを作成できません。お問い合わせフォームからご連絡ください。")
+        raise ApiError(403, "アカウントを作成できません。お問い合わせフォームからご連絡ください。", code="AUTH_SIGNUP_BLOCKED")
 
     if not _EMAIL_RE.match(email):
-        raise ApiError(400, "メールアドレスの形式が正しくありません")
+        raise ApiError(400, "メールアドレスの形式が正しくありません", code="VALIDATION_INVALID_EMAIL")
     if len(password) < 8:
-        raise ApiError(400, "パスワードは8文字以上にしてください")
+        raise ApiError(400, "パスワードは8文字以上にしてください", code="VALIDATION_PASSWORD_TOO_SHORT")
     if not body.get("agreed_to_terms"):
-        raise ApiError(400, "利用規約への同意が必要です")
+        raise ApiError(400, "利用規約への同意が必要です", code="VALIDATION_TERMS_NOT_AGREED")
 
     users = _load_users()
     if email in users:
-        raise ApiError(409, "このメールアドレスは既に登録されています")
+        raise ApiError(409, "このメールアドレスは既に登録されています", code="AUTH_EMAIL_ALREADY_REGISTERED")
 
     users[email] = {
         "password_hash": werkzeug.security.generate_password_hash(password),
@@ -554,7 +554,7 @@ def auth_login():
     user = users.get(email)
     if not user or not werkzeug.security.check_password_hash(user["password_hash"], password):
         log("auth", f"login failed: {email} from {client_ip}", "red")
-        raise ApiError(401, "メールアドレスまたはパスワードが違います")
+        raise ApiError(401, "メールアドレスまたはパスワードが違います", code="AUTH_INVALID_CREDENTIALS")
 
     user["last_login_ip"] = client_ip
     user["last_login_at"] = time.time()
@@ -570,7 +570,7 @@ def auth_verify():
     body = request.get_json(silent=True) or {}
     email = _verify_session_token(body.get("token"))
     if not email:
-        raise ApiError(401, "セッションが無効か期限切れです")
+        raise ApiError(401, "セッションが無効か期限切れです", code="AUTH_SESSION_INVALID")
     return jsonify({"email": email})
 
 
@@ -645,11 +645,11 @@ def _fetch_wakame_trending():
 
     resp = _fetch_page(WAKAME_TREND_URL, timeout=30)
     if resp.status_code >= 400:
-        raise ApiError(502, f"failed to fetch trending source: HTTP {resp.status_code}")
+        raise ApiError(502, f"failed to fetch trending source: HTTP {resp.status_code}", code="UPSTREAM_FETCH_FAILED")
     try:
         raw = json.loads(resp.text)
     except json.JSONDecodeError as e:
-        raise ApiError(502, f"failed to parse trending source: {e}")
+        raise ApiError(502, f"failed to parse trending source: {e}", code="UPSTREAM_PARSE_FAILED")
 
     categories = {
         key: [_convert_wakame_entry(e) for e in (raw.get(key) or [])]
@@ -1059,12 +1059,12 @@ _INQUIRY_MESSAGE_MAX_LEN = 2000
 
 def _validate_inquiry_text(value, field_name, max_len):
     if not isinstance(value, str):
-        raise ApiError(400, f"{field_name}は文字列で指定してください")
+        raise ApiError(400, f"{field_name}は文字列で指定してください", code="VALIDATION_FIELD_NOT_STRING")
     value = value.strip()
     if not value:
-        raise ApiError(400, f"{field_name}を入力してください")
+        raise ApiError(400, f"{field_name}を入力してください", code="VALIDATION_FIELD_REQUIRED")
     if len(value) > max_len:
-        raise ApiError(400, f"{field_name}は{max_len}文字以内にしてください")
+        raise ApiError(400, f"{field_name}は{max_len}文字以内にしてください", code="VALIDATION_FIELD_TOO_LONG")
     return value
 
 
@@ -1139,12 +1139,12 @@ _PLAYLIST_MAX_VIDEOS = 100
 
 def _validate_playlist_name(name):
     if not isinstance(name, str):
-        raise ApiError(400, "プレイリスト名は文字列で指定してください")
+        raise ApiError(400, "プレイリスト名は文字列で指定してください", code="VALIDATION_PLAYLIST_NAME_NOT_STRING")
     name = name.strip()
     if not name:
-        raise ApiError(400, "プレイリスト名を入力してください")
+        raise ApiError(400, "プレイリスト名を入力してください", code="VALIDATION_PLAYLIST_NAME_REQUIRED")
     if len(name) > _PLAYLIST_NAME_MAX_LEN:
-        raise ApiError(400, f"プレイリスト名は{_PLAYLIST_NAME_MAX_LEN}文字以内にしてください")
+        raise ApiError(400, f"プレイリスト名は{_PLAYLIST_NAME_MAX_LEN}文字以内にしてください", code="VALIDATION_PLAYLIST_NAME_TOO_LONG")
     return name
 
 
@@ -1186,7 +1186,7 @@ def _create_playlist(email, name):
             "SELECT COUNT(*) AS c FROM user_playlists WHERE email = ?", (email,)
         ).fetchone()["c"]
         if count >= _PLAYLIST_MAX_COUNT_PER_USER:
-            raise ApiError(409, f"プレイリストは{_PLAYLIST_MAX_COUNT_PER_USER}個までしか作成できません")
+            raise ApiError(409, f"プレイリストは{_PLAYLIST_MAX_COUNT_PER_USER}個までしか作成できません", code="LIMIT_PLAYLIST_COUNT_EXCEEDED")
         cur = conn.execute(
             "INSERT INTO user_playlists (email, name, created_at) VALUES (?, ?, ?)",
             (email, name, time.time()),
@@ -1217,7 +1217,7 @@ def _add_video_to_playlist(playlist_id, video_id, title, thumbnail, channel, dur
             "SELECT COUNT(*) AS c FROM user_playlist_videos WHERE playlist_id = ?", (playlist_id,)
         ).fetchone()["c"]
         if count >= _PLAYLIST_MAX_VIDEOS:
-            raise ApiError(409, f"このプレイリストには{_PLAYLIST_MAX_VIDEOS}本までしか追加できません")
+            raise ApiError(409, f"このプレイリストには{_PLAYLIST_MAX_VIDEOS}本までしか追加できません", code="LIMIT_PLAYLIST_VIDEOS_EXCEEDED")
         conn.execute(
             "INSERT INTO user_playlist_videos (playlist_id, video_id, title, thumbnail, channel, duration, position, added_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1244,11 +1244,11 @@ def _get_banned_words():
 def _add_banned_word(word, added_by):
     word = (word or "").strip().lower()
     if not word:
-        raise ApiError(400, "word is required")
+        raise ApiError(400, "word is required", code="VALIDATION_WORD_REQUIRED")
     if len(word) < 2:
-        raise ApiError(400, "word must be at least 2 characters (1文字だけだと誤検知が多すぎるため)")
+        raise ApiError(400, "word must be at least 2 characters (1文字だけだと誤検知が多すぎるため)", code="VALIDATION_WORD_TOO_SHORT")
     if len(word) > 100:
-        raise ApiError(400, "word must be 100 characters or fewer")
+        raise ApiError(400, "word must be 100 characters or fewer", code="VALIDATION_WORD_TOO_LONG")
     with _CACHE_DB_LOCK, _db() as conn:
         try:
             conn.execute(
@@ -1339,7 +1339,7 @@ def _check_video_moderation_or_ban(video_id, data):
         if email:
             _ban_email(email, "NGワードを含む動画の視聴", matched_word=matched_word, context=context, ip=client_ip)
         log("denied", f"NGワード動画の視聴によりBAN: ip={client_ip} email={email} (word={matched_word}, video={video_id})", "red")
-        raise ApiError(403, "利用を制限されました。お問い合わせフォームからご連絡ください。")
+        raise ApiError(403, "利用を制限されました。お問い合わせフォームからご連絡ください。", code="MODERATION_BANNED")
 
     groq_result = _check_title_with_groq(title)
     if groq_result and groq_result[0]:
@@ -1352,7 +1352,7 @@ def _check_video_moderation_or_ban(video_id, data):
         if email:
             _ban_email(email, "AI判定により不適切と判断された動画の視聴", context=context, ip=client_ip)
         log("denied", f"AI判定によりBAN: ip={client_ip} email={email} (video={video_id}, reason={reason})", "red")
-        raise ApiError(403, "利用を制限されました。お問い合わせフォームからご連絡ください。")
+        raise ApiError(403, "利用を制限されました。お問い合わせフォームからご連絡ください。", code="MODERATION_BANNED")
 
 
 def _log_ban_event(ip, email, event_type, reason=None, matched_word=None, context=None):
@@ -1452,7 +1452,7 @@ def _get_moderation_policy():
 def _set_moderation_policy(policy):
     policy = (policy or "").strip()
     if len(policy) > 2000:
-        raise ApiError(400, "判定基準は2000文字以内にしてください")
+        raise ApiError(400, "判定基準は2000文字以内にしてください", code="VALIDATION_POLICY_TOO_LONG")
     with _CACHE_DB_LOCK, _db() as conn:
         conn.execute("""
             INSERT INTO moderation_settings (key, value) VALUES ('moderation_policy', ?)
@@ -1549,9 +1549,9 @@ def _check_and_bump_inquiry_rate_limit(identity):
         if row and row["day_key"] == day_key:
             if now - row["last_submitted_at"] < _INQUIRY_RATE_LIMIT_COOLDOWN_SEC:
                 wait = int(_INQUIRY_RATE_LIMIT_COOLDOWN_SEC - (now - row["last_submitted_at"]))
-                raise ApiError(429, f"連続で送信することはできません。{wait}秒待ってから再度お試しください")
+                raise ApiError(429, f"連続で送信することはできません。{wait}秒待ってから再度お試しください", code="RATE_LIMIT_COOLDOWN")
             if row["count_today"] >= _INQUIRY_RATE_LIMIT_MAX_PER_DAY:
-                raise ApiError(429, f"お問い合わせは1日{_INQUIRY_RATE_LIMIT_MAX_PER_DAY}件までです。また明日お試しください")
+                raise ApiError(429, f"お問い合わせは1日{_INQUIRY_RATE_LIMIT_MAX_PER_DAY}件までです。また明日お試しください", code="RATE_LIMIT_DAILY_EXCEEDED")
             new_count = row["count_today"] + 1
         else:
             new_count = 1
@@ -1771,7 +1771,7 @@ def _fetch_page(url, timeout=60):
         raw = e.read() if e.fp else b""
         content_encoding = e.headers.get("Content-Encoding", "") if e.headers else ""
     except urllib.error.URLError as e:
-        raise ApiError(502, f"failed to fetch page: {e.reason}")
+        raise ApiError(502, f"failed to fetch page: {e.reason}", code="UPSTREAM_PAGE_FETCH_FAILED")
     raw = _decompress_body(raw, content_encoding)
     return _PageResponse(status, raw.decode("utf-8", errors="replace"))
 
@@ -1818,15 +1818,23 @@ def _ydl_opts(extra=None, cookiefile_override=None):
 
 
 class ApiError(Exception):
-    def __init__(self, status_code, message):
+    """
+    codeは、フロントエンドやAPI利用者がエラーの種類を「文言に頼らず」機械的に
+    判別するための識別子(例: "AUTH_INVALID_CREDENTIALS")。HTTPステータスコードだけ
+    だと、同じ400でも「メール形式が不正」「パスワードが短すぎる」等、複数の意味が
+    混在してしまうため、それぞれに一意のコードを割り当てている。
+    未指定の場合は自動的に "UNKNOWN_ERROR" になる(移行漏れの検出用)。
+    """
+    def __init__(self, status_code, message, code="UNKNOWN_ERROR"):
         super().__init__(message)
         self.status_code = status_code
         self.message = message
+        self.code = code
 
 
 @app.errorhandler(ApiError)
 def _handle_api_error(err):
-    return jsonify({"detail": err.message}), err.status_code
+    return jsonify({"detail": err.message, "code": err.code}), err.status_code
 
 
 _NETWORK_ERROR_HINTS = (
@@ -1860,6 +1868,16 @@ def _looks_like_auth_or_format_error(message):
     return any(hint.lower() in lowered for hint in _AUTH_ERROR_HINTS)
 
 
+# Node.js(署名解読)を使った抽出は、スマホ(Termux)のCPU・メモリに対して
+# それなりに重い処理。同時に何本も走ると全体が詰まって遅くなるので、
+# 同時実行数を制限し、枠が空くまでは待機列に並ばせる形にする。
+# 待っても一定時間空かない場合は、諦めて分かりやすいエラーにする
+# (無限に待たされ続けるより、早めに「混み合っています」と伝えた方が親切なため)。
+_NODE_EXTRACT_MAX_CONCURRENT = 3
+_NODE_EXTRACT_SEMAPHORE = threading.Semaphore(_NODE_EXTRACT_MAX_CONCURRENT)
+_NODE_EXTRACT_WAIT_TIMEOUT_SEC = 90
+
+
 def _extract(source_url, extra_opts=None, retries=2, retry_delay=1.5, max_cookie_attempts=None, use_cookies=True):
     """
     VPN切断・回線の瞬断など「サーバー側は悪くないが一時的にネットが繋がらない」ケースを
@@ -1872,43 +1890,51 @@ def _extract(source_url, extra_opts=None, retries=2, retry_delay=1.5, max_cookie
     (cookies.txt, cookies2.txt, ...)を順番に試す。1つのアカウントの調子が
     悪くても、他のアカウントのcookieで通ることがあるため。
 
-    use_cookies=False にすると、Cookieを一切使わずに抽出する(高速パス専用)。
-    実測で、Cookieを渡すとyt-dlpがログイン済み向けの別クライアント(tv_downgraded等)に
-    切り替わり、Node.js無しの状態だとそちらでは映像+音声一体のフォーマットが
-    手に入らず失敗する、ということが確認できたための対応
-    (compare_extraction.pyでの検証結果、2026-08-09)。
+    use_cookies=False にすると、Cookieを一切使わずに抽出する。
+
+    同時実行数は_NODE_EXTRACT_MAX_CONCURRENTまでに制限される。それを超える
+    リクエストは、枠が空くまで最大_NODE_EXTRACT_WAIT_TIMEOUT_SEC秒待機し、
+    それでも空かなければ503エラーになる(1回の呼び出し = 1つの枠、Cookie切り替えの
+    リトライ中も同じ枠を保持し続けるので、待ち行列としては公平な動作になる)。
     """
-    if not use_cookies:
-        cookie_candidates = [None]
-    else:
-        cookie_candidates = COOKIES_FILE_PATHS or [None]
-        if max_cookie_attempts:
-            cookie_candidates = cookie_candidates[:max_cookie_attempts]
-    last_error = None
+    acquired = _NODE_EXTRACT_SEMAPHORE.acquire(timeout=_NODE_EXTRACT_WAIT_TIMEOUT_SEC)
+    if not acquired:
+        raise ApiError(503, "サーバーが混み合っています。しばらくしてから再度お試しください。", code="SERVER_BUSY")
 
-    for cookiefile in cookie_candidates:
-        for attempt in range(retries + 1):
-            try:
-                with yt_dlp.YoutubeDL(_ydl_opts(extra_opts, cookiefile_override=cookiefile)) as ydl:
-                    return ydl.extract_info(source_url, download=False)
-            except yt_dlp.utils.DownloadError as e:
-                message = str(e)
-                if _looks_like_network_error(message):
-                    last_error = message
-                    if attempt < retries:
-                        time.sleep(retry_delay)
-                    continue
-                if _looks_like_auth_or_format_error(message) and cookiefile != cookie_candidates[-1]:
-                    # このcookieでは通らなかった。次のcookieに切り替える。
-                    last_error = message
-                    break
-                raise ApiError(400, f"yt-dlp error: {message}")
+    try:
+        if not use_cookies:
+            cookie_candidates = [None]
         else:
-            # ネットワークエラーでretries回とも失敗し、forがbreakせず終わった場合は
-            # このcookieでの再試行を使い切ったとみなし、次のcookieには進まず打ち切る。
-            raise ApiError(503, f"ネットワーク接続が不安定です(VPN切断等の可能性)。しばらくしてから再度お試しください: {last_error}")
+            cookie_candidates = COOKIES_FILE_PATHS or [None]
+            if max_cookie_attempts:
+                cookie_candidates = cookie_candidates[:max_cookie_attempts]
+        last_error = None
 
-    raise ApiError(400, f"yt-dlp error: {last_error}")
+        for cookiefile in cookie_candidates:
+            for attempt in range(retries + 1):
+                try:
+                    with yt_dlp.YoutubeDL(_ydl_opts(extra_opts, cookiefile_override=cookiefile)) as ydl:
+                        return ydl.extract_info(source_url, download=False)
+                except yt_dlp.utils.DownloadError as e:
+                    message = str(e)
+                    if _looks_like_network_error(message):
+                        last_error = message
+                        if attempt < retries:
+                            time.sleep(retry_delay)
+                        continue
+                    if _looks_like_auth_or_format_error(message) and cookiefile != cookie_candidates[-1]:
+                        # このcookieでは通らなかった。次のcookieに切り替える。
+                        last_error = message
+                        break
+                    raise ApiError(400, f"yt-dlp error: {message}", code="EXTRACTION_FAILED")
+            else:
+                # ネットワークエラーでretries回とも失敗し、forがbreakせず終わった場合は
+                # このcookieでの再試行を使い切ったとみなし、次のcookieには進まず打ち切る。
+                raise ApiError(503, f"ネットワーク接続が不安定です(VPN切断等の可能性)。しばらくしてから再度お試しください: {last_error}", code="NETWORK_UNSTABLE")
+
+        raise ApiError(400, f"yt-dlp error: {last_error}", code="EXTRACTION_FAILED")
+    finally:
+        _NODE_EXTRACT_SEMAPHORE.release()
 
 
 _RAW_EXTRACT_CACHE_TTL_SEC = 120  # /api/info と /api/stream が同じ動画を数秒差で
@@ -1944,47 +1970,6 @@ def _extract_full(video_id):
 
 
 _FAST_EXTRACT_TIMEOUT_SEC = 8
-
-
-def _extract_fast(video_id):
-    """
-    Node.js(署名解読)を無効化した状態で動画情報を取る。yt-dlpは、Node.js等の
-    JavaScriptランタイムが使えない場合、自動的にJS不要なクライアント(android_vr等、
-    バージョンによって組み合わせは変わる)にフォールバックしてくれる。これは
-    こちらでクライアントを決め打ちするより、a-Shell(端末にNode.js自体が無い環境)で
-    確認した時の挙動に忠実で、かつyt-dlpのバージョンが上がってクライアントの
-    組み合わせが変わっても追従できる。
-    通常のフォーマット取得(Node.jsでの署名解読あり)より圧倒的に速いが、
-    低画質(360p相当)のフォーマットしか手に入らないことが多い。動画ページを開いた
-    直後、まず低画質でもいいのですぐ再生を始めたい場合に使う。
-    失敗した・実際に再生可能なフォーマット(映像+音声が一体のもの、またはHLS)が
-    1つも無かった場合はNoneを返す(呼び出し側で通常の方式にフォールバックすること)。
-    formatsキー自体が空でないだけでは不十分(映像だけ・音声だけの分離フォーマットしか
-    無いこともあり、それだと自作プレイヤー側では再生できないため、事前に弾いておく)。
-    """
-    try:
-        source_url = _resolve_url(video_id)
-        data = _extract(
-            source_url,
-            extra_opts={"js_runtimes": {}, "remote_components": []},
-            retries=0,
-            use_cookies=False,
-        )
-    except Exception as e:
-        log("access", f"高速パス失敗(video_id={video_id}): {e}", "yellow")
-        return None
-    if not data or not data.get("formats"):
-        log("access", f"高速パス: フォーマットが1つも無かった(video_id={video_id})", "yellow")
-        return None
-
-    has_playable = any(
-        f.get("url") and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
-        for f in data["formats"]
-    )
-    if not has_playable and not data.get("manifest_url"):
-        log("access", f"高速パス: 再生可能な(映像+音声一体の)フォーマットが無かった(video_id={video_id})", "yellow")
-        return None
-    return data
 
 
 def _extract_flat(url, playliststart=None, playlistend=None):
@@ -2024,7 +2009,7 @@ def _extract_flat(url, playliststart=None, playlistend=None):
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as e:
-        raise ApiError(400, f"yt-dlp error: {e}")
+        raise ApiError(400, f"yt-dlp error: {e}", code="EXTRACTION_FAILED")
 
 
 _PLAYLIST_ID_PREFIXES = ("PL", "UU", "LL", "WL", "FL", "RD", "OL")
@@ -2079,7 +2064,7 @@ def post_history():
     body = request.get_json(silent=True) or {}
     video_id = body.get("video_id")
     if not video_id:
-        raise ApiError(400, "video_id is required")
+        raise ApiError(400, "video_id is required", code="VALIDATION_VIDEO_ID_REQUIRED")
     _record_watch_history(body)
     return jsonify({"ok": True})
 
@@ -2102,7 +2087,7 @@ def _authed_email():
     token = request.headers.get("X-Session-Token", "")
     email = _verify_session_token(token)
     if not email:
-        raise ApiError(401, "ログインが必要です")
+        raise ApiError(401, "ログインが必要です", code="AUTH_LOGIN_REQUIRED")
     return email
 
 
@@ -2135,7 +2120,7 @@ def update_my_profile():
     with _AUTH_LOCK:
         users = _load_users()
         if email not in users:
-            raise ApiError(404, "ユーザーが見つかりません")
+            raise ApiError(404, "ユーザーが見つかりません", code="NOT_FOUND_USER")
 
         display_name = _validate_display_name(body.get("display_name"))
         user_id = _validate_user_id(body.get("user_id"), users, email)
@@ -2192,11 +2177,11 @@ def get_inquiry_endpoint(inquiry_id):
     email = _authed_email()
     inquiry = _get_inquiry(inquiry_id)
     if not inquiry:
-        raise ApiError(404, "お問い合わせが見つかりません")
+        raise ApiError(404, "お問い合わせが見つかりません", code="NOT_FOUND_INQUIRY")
     is_owner = email in OWNER_EMAILS
     if not is_owner and inquiry["email"] != email:
         # 他人のお問い合わせは、オーナーでない限り見えない(存在の有無も分からないよう404にする)
-        raise ApiError(404, "お問い合わせが見つかりません")
+        raise ApiError(404, "お問い合わせが見つかりません", code="NOT_FOUND_INQUIRY")
     replies = _get_inquiry_replies(inquiry_id)
 
     # LINEのような見た目にするため、発言者ごとのアイコン・表示名も一緒に返す
@@ -2218,10 +2203,10 @@ def reply_inquiry_endpoint(inquiry_id):
     email = _authed_email()
     inquiry = _get_inquiry(inquiry_id)
     if not inquiry:
-        raise ApiError(404, "お問い合わせが見つかりません")
+        raise ApiError(404, "お問い合わせが見つかりません", code="NOT_FOUND_INQUIRY")
     is_owner = email in OWNER_EMAILS
     if not is_owner and inquiry["email"] != email:
-        raise ApiError(404, "お問い合わせが見つかりません")
+        raise ApiError(404, "お問い合わせが見つかりません", code="NOT_FOUND_INQUIRY")
     body = request.get_json(silent=True) or {}
     message = _validate_inquiry_text(body.get("message"), "本文", _INQUIRY_MESSAGE_MAX_LEN)
     _add_inquiry_reply(inquiry_id, email, is_owner, message)
@@ -2233,10 +2218,10 @@ def delete_inquiry_endpoint(inquiry_id):
     """お問い合わせを削除する。オーナーだけができる破壊的操作。"""
     email = _authed_email()
     if email not in OWNER_EMAILS:
-        raise ApiError(403, "オーナーのみ削除できます")
+        raise ApiError(403, "オーナーのみ削除できます", code="PERMISSION_OWNER_ONLY")
     inquiry = _get_inquiry(inquiry_id)
     if not inquiry:
-        raise ApiError(404, "お問い合わせが見つかりません")
+        raise ApiError(404, "お問い合わせが見つかりません", code="NOT_FOUND_INQUIRY")
     _delete_inquiry(inquiry_id)
     return jsonify({"ok": True})
 
@@ -2244,7 +2229,7 @@ def delete_inquiry_endpoint(inquiry_id):
 def _get_owned_playlist_or_404(playlist_id, email):
     playlist = _get_playlist(playlist_id)
     if not playlist or playlist["email"] != email:
-        raise ApiError(404, "プレイリストが見つかりません")
+        raise ApiError(404, "プレイリストが見つかりません", code="NOT_FOUND_PLAYLIST")
     return playlist
 
 
@@ -2296,7 +2281,7 @@ def add_playlist_video_endpoint(playlist_id):
     body = request.get_json(silent=True) or {}
     video_id = body.get("video_id")
     if not video_id:
-        raise ApiError(400, "video_id is required")
+        raise ApiError(400, "video_id is required", code="VALIDATION_VIDEO_ID_REQUIRED")
     _add_video_to_playlist(
         playlist_id, video_id, body.get("title"), body.get("thumbnail"), body.get("channel"), body.get("duration")
     )
@@ -2314,7 +2299,7 @@ def remove_playlist_video_endpoint(playlist_id, video_id):
 def _require_owner():
     email = _authed_email()
     if email not in OWNER_EMAILS:
-        raise ApiError(403, "オーナーのみアクセスできます")
+        raise ApiError(403, "オーナーのみアクセスできます", code="PERMISSION_OWNER_ONLY")
     return email
 
 
@@ -2335,7 +2320,7 @@ def remove_banned_word_by_text_endpoint():
     body = request.get_json(silent=True) or {}
     removed = _remove_banned_word_by_text(body.get("word"))
     if not removed:
-        raise ApiError(404, "指定した単語は登録されていません")
+        raise ApiError(404, "指定した単語は登録されていません", code="NOT_FOUND_BANNED_WORD")
     return jsonify({"ok": True})
 
 
@@ -2385,13 +2370,13 @@ def import_banned_words_from_url_endpoint():
     body = request.get_json(silent=True) or {}
     url = (body.get("url") or "").strip()
     if not url.startswith(("http://", "https://")):
-        raise ApiError(400, "有効なURLを指定してください")
+        raise ApiError(400, "有効なURLを指定してください", code="VALIDATION_INVALID_URL")
     try:
         resp = requests.get(url, timeout=15)
     except requests.RequestException as e:
-        raise ApiError(502, f"URLの取得に失敗しました: {e}")
+        raise ApiError(502, f"URLの取得に失敗しました: {e}", code="UPSTREAM_FETCH_FAILED")
     if resp.status_code >= 400:
-        raise ApiError(502, f"URLの取得に失敗しました: HTTP {resp.status_code}")
+        raise ApiError(502, f"URLの取得に失敗しました: HTTP {resp.status_code}", code="UPSTREAM_FETCH_FAILED")
 
     words = [w.strip() for w in re.split(r"[\n,]+", resp.text) if w.strip() and not w.strip().startswith("#")]
     added = 0
@@ -2423,7 +2408,7 @@ def add_banned_ip_endpoint():
     body = request.get_json(silent=True) or {}
     ip = (body.get("ip") or "").strip()
     if not ip:
-        raise ApiError(400, "ip is required")
+        raise ApiError(400, "ip is required", code="VALIDATION_IP_REQUIRED")
     _ban_ip(ip, body.get("reason") or "手動でのBAN", banned_by=owner_email, is_manual=True)
     return jsonify({"ok": True})
 
@@ -2447,7 +2432,7 @@ def add_banned_email_endpoint():
     body = request.get_json(silent=True) or {}
     email = (body.get("email") or "").strip()
     if not email:
-        raise ApiError(400, "email is required")
+        raise ApiError(400, "email is required", code="VALIDATION_EMAIL_REQUIRED")
     _ban_email(email, body.get("reason") or "手動でのBAN", banned_by=owner_email, is_manual=True)
     return jsonify({"ok": True})
 
@@ -2525,7 +2510,7 @@ def add_user_subscription_endpoint():
     body = request.get_json(silent=True) or {}
     channel_id = body.get("channel_id")
     if not channel_id:
-        raise ApiError(400, "channel_id is required")
+        raise ApiError(400, "channel_id is required", code="VALIDATION_CHANNEL_ID_REQUIRED")
     _add_user_subscription(email, channel_id, body.get("channel"), body.get("thumbnail"))
     return jsonify({"ok": True})
 
@@ -2549,7 +2534,7 @@ def add_user_like_endpoint():
     body = request.get_json(silent=True) or {}
     video_id = body.get("video_id")
     if not video_id:
-        raise ApiError(400, "video_id is required")
+        raise ApiError(400, "video_id is required", code="VALIDATION_VIDEO_ID_REQUIRED")
     _add_user_like(email, video_id, body.get("title"), body.get("thumbnail"), body.get("channel"), body.get("duration"))
     return jsonify({"ok": True})
 
@@ -3019,7 +3004,7 @@ def cache_get(video_id):
     with _CACHE_DB_LOCK, _db() as conn:
         row = conn.execute("SELECT * FROM cache WHERE video_id = ?", (video_id,)).fetchone()
     if not row:
-        raise ApiError(404, "not in cache")
+        raise ApiError(404, "not in cache", code="NOT_FOUND_CACHE")
     return jsonify({
         "video_id": row["video_id"],
         "title": row["title"],
@@ -3038,7 +3023,7 @@ def cache_delete(video_id):
         cur = conn.execute("DELETE FROM cache WHERE video_id = ?", (video_id,))
         conn.execute("DELETE FROM response_cache WHERE video_id = ?", (video_id,))
     if cur.rowcount == 0:
-        raise ApiError(404, "not in cache")
+        raise ApiError(404, "not in cache", code="NOT_FOUND_CACHE")
     return jsonify({"deleted": video_id})
 
 
@@ -3108,7 +3093,7 @@ def search():
     """
     q = request.args.get("q")
     if not q:
-        raise ApiError(400, "query parameter 'q' is required")
+        raise ApiError(400, "query parameter 'q' is required", code="VALIDATION_QUERY_REQUIRED")
 
     matched_word = _find_matched_banned_word(q)
     if matched_word:
@@ -3119,7 +3104,7 @@ def search():
         if email:
             _ban_email(email, "NGワードを含む検索", matched_word=matched_word, context=q[:200], ip=client_ip)
         log("denied", f"NGワード検索によりBAN: ip={client_ip} email={email} (word={matched_word})", "red")
-        raise ApiError(403, "利用を制限されました。お問い合わせフォームからご連絡ください。")
+        raise ApiError(403, "利用を制限されました。お問い合わせフォームからご連絡ください。", code="MODERATION_BANNED")
 
     limit = max(1, min(int(request.args.get("limit", 20)), 50))
     continuation_token = request.args.get("continuation")
@@ -3363,16 +3348,16 @@ def subtitles(video_id):
     tracks = pool.get(lang)
     if not tracks:
         kind = "自動生成" if auto else "手動"
-        raise ApiError(404, f"{kind}字幕が見つかりません (lang={lang})")
+        raise ApiError(404, f"{kind}字幕が見つかりません (lang={lang})", code="NOT_FOUND_SUBTITLE")
 
     track = next((t for t in tracks if t.get("ext") == "vtt"), tracks[0])
     sub_url = track.get("url")
     if not sub_url:
-        raise ApiError(404, "subtitle url not found")
+        raise ApiError(404, "subtitle url not found", code="NOT_FOUND_SUBTITLE_URL")
 
     resp = _fetch_page(sub_url, timeout=60)
     if resp.status_code >= 400:
-        raise ApiError(502, f"failed to fetch subtitle: HTTP {resp.status_code}")
+        raise ApiError(502, f"failed to fetch subtitle: HTTP {resp.status_code}", code="UPSTREAM_SUBTITLE_FETCH_FAILED")
 
     return Response(resp.text, mimetype="text/vtt")
 
@@ -3449,15 +3434,15 @@ def livechat(video_id):
         data = _extract(source_url)
         live_chat_formats = (data.get("subtitles") or {}).get("live_chat") or []
         if not live_chat_formats:
-            raise ApiError(404, "this video has no live chat available (not a livestream, or chat replay is disabled)")
+            raise ApiError(404, "this video has no live chat available (not a livestream, or chat replay is disabled)", code="NOT_FOUND_LIVE_CHAT")
 
         chat_url = live_chat_formats[0].get("url")
         if not chat_url:
-            raise ApiError(404, "live chat url not found")
+            raise ApiError(404, "live chat url not found", code="NOT_FOUND_LIVE_CHAT_URL")
 
         resp = _fetch_page(chat_url, timeout=60)
         if resp.status_code >= 400:
-            raise ApiError(502, f"failed to fetch live chat data: HTTP {resp.status_code}")
+            raise ApiError(502, f"failed to fetch live chat data: HTTP {resp.status_code}", code="UPSTREAM_LIVE_CHAT_FETCH_FAILED")
 
     messages = []
     for line in resp.text.splitlines():
@@ -3590,13 +3575,13 @@ def _fetch_youtube_continuation(endpoint, api_key, context, continuation_token, 
         raw = e.read() if e.fp else b""
         content_encoding = e.headers.get("Content-Encoding", "") if e.headers else ""
     except urllib.error.URLError as e:
-        raise ApiError(502, f"failed to fetch continuation: {e.reason}")
+        raise ApiError(502, f"failed to fetch continuation: {e.reason}", code="UPSTREAM_CONTINUATION_FETCH_FAILED")
 
     raw = _decompress_body(raw, content_encoding)
     try:
         return json.loads(raw.decode("utf-8", errors="replace"))
     except json.JSONDecodeError as e:
-        raise ApiError(502, f"failed to parse continuation response: {e}")
+        raise ApiError(502, f"failed to parse continuation response: {e}", code="UPSTREAM_CONTINUATION_PARSE_FAILED")
 
 
 def _extract_yt_initial_data(html):
@@ -4103,7 +4088,7 @@ def related(video_id):
     with _track_processing(video_id, "related"):
         resp = _fetch_page(_add_lang_params(watch_url), timeout=60)
         if resp.status_code >= 400:
-            raise ApiError(502, f"watch page returned HTTP {resp.status_code}")
+            raise ApiError(502, f"watch page returned HTTP {resp.status_code}", code="UPSTREAM_WATCH_PAGE_FETCH_FAILED")
         yt_data = _extract_yt_initial_data(resp.text)
 
     if yt_data is None:
@@ -4111,6 +4096,7 @@ def related(video_id):
             502,
             "failed to parse ytInitialData from the watch page "
             "(YouTube may have changed its page structure, or this isn't a YouTube video)",
+            code="UPSTREAM_PARSE_FAILED",
         )
 
     entries = _parse_video_cards(yt_data, video_id, limit)
@@ -4322,7 +4308,7 @@ def _resolve_direct_url(video_id, format_id, use_cache=True):
     if not stream_url and data.get("requested_formats"):
         stream_url = data["requested_formats"][0].get("url")
     if not stream_url:
-        raise ApiError(404, "direct url not found for this format")
+        raise ApiError(404, "direct url not found for this format", code="NOT_FOUND_DIRECT_URL")
 
     _STREAM_URL_CACHE[cache_key] = (stream_url, time.time() + STREAM_URL_CACHE_TTL_SEC)
     return stream_url
@@ -4360,10 +4346,10 @@ def proxy_stream(video_id):
         try:
             upstream = _try_fetch(use_cache=False)
         except requests.RequestException as e:
-            raise ApiError(502, f"upstream fetch failed: {e}")
+            raise ApiError(502, f"upstream fetch failed: {e}", code="UPSTREAM_MEDIA_FETCH_FAILED")
         if upstream.status_code >= 400:
             upstream.close()
-            raise ApiError(502, f"upstream returned {upstream.status_code}")
+            raise ApiError(502, f"upstream returned {upstream.status_code}", code="UPSTREAM_MEDIA_FETCH_FAILED")
 
     passthrough_headers = {}
     for h in ("Content-Range", "Content-Length", "Accept-Ranges", "Content-Type"):
@@ -4393,29 +4379,6 @@ def proxy_stream(video_id):
 
     status_code = 206 if range_header and "Content-Range" in upstream.headers else upstream.status_code
     return Response(gen(), status=status_code, headers=passthrough_headers)
-
-
-@app.get("/api/stream-fast/<video_id>")
-def stream_fast(video_id):
-    """
-    android_vrクライアントだけを使った高速版。動画ページを開いた直後、
-    通常の(遅い)/api/streamの結果を待たずにすぐ再生を始めたい場合に使う。
-    低画質(360p相当)のフォーマットしか返せない・キャッシュもしない
-    (あくまで「とりあえず今すぐ再生を始める」ための一時的なデータのため)。
-    取得できなかった場合は、そのことが分かるように ok:false を返す
-    (エラーにはしない。呼び出し側で通常の/api/streamにフォールバックする想定)。
-    """
-    data = _extract_fast(video_id)
-    if not data:
-        return jsonify({"ok": False})
-
-    # 高速版でもモデレーションは省略しない
-    _check_video_moderation_or_ban(video_id, data)
-
-    result = _build_stream_payload(video_id, data)
-    result["ok"] = True
-    result["fast"] = True
-    return jsonify(result)
 
 
 @app.get("/api/stream/<video_id>")
@@ -4452,7 +4415,7 @@ def stream(video_id):
         # ignore_no_formats_error で例外は抑えたが、結局1つも再生可能なデータが
         # 得られなかった場合(ライブ配信がまだ始まっていない、等)は、
         # 空っぽの再生不可能なレスポンスをそのまま返さず、分かりやすいエラーにする。
-        raise ApiError(400, "再生可能な動画/配信データが見つかりませんでした(配信がまだ始まっていない可能性があります)")
+        raise ApiError(400, "再生可能な動画/配信データが見つかりませんでした(配信がまだ始まっていない可能性があります)", code="EXTRACTION_NO_PLAYABLE_DATA")
     _response_cache_set(key, "stream", video_id, result)
 
     result = dict(result)
