@@ -1798,7 +1798,7 @@ def _ydl_opts(extra=None, cookiefile_override=None):
         "noplaylist": True,
         "skip_download": True,
         "nocheckcertificate": True,
-        "extractor_args": {"youtube": {"lang": ["ja"]}},
+        "extractor_args": {"youtube": {"lang": ["ja"], "player_client": ["mweb"]}},
         # ライブ配信で"No video formats found!"エラーになることがある既知のyt-dlp側の問題への
         # 対策として、見つからない場合にエラーで落とさず、manifest_url(HLSのマスター
         # プレイリストURL)だけでも拾えるようにする。
@@ -1808,6 +1808,15 @@ def _ydl_opts(extra=None, cookiefile_override=None):
         # PO Tokenを検証されて弾かれる)ことが判明したため撤去した。Node.jsでの署名解読を
         # 正規に通ったフォーマットだけを使う方が、多少フォーマットの選択肢が減っても
         # 確実に再生できる。
+        #
+        # player_client を明示的に mweb に固定している理由:
+        # クライアントを指定せずyt-dlpの自動選択に任せると、Node.jsが使える状態でも
+        # 「android_vr」(取得直後から失効しているブラウザ非対応URL)や、HLS経由の
+        # 映像のみのフォーマットが優先的に選ばれてしまい、自作プレイヤーで正しく
+        # 再生できないことが実機検証で確認できた。mwebクライアントを明示指定した場合
+        # だけ、Node.jsでの署名解読(node --permission による安全な実行)が実際に
+        # 発動し、映像+音声が一体になった、ブラウザから直接再生できるURLが返って
+        # くることを確認済み(2026-08-10)。
         "ignore_no_formats_error": True,
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
@@ -2002,7 +2011,7 @@ def _extract_flat(url, playliststart=None, playlistend=None):
         "no_warnings": True,
         "nocheckcertificate": True,
         "extract_flat": "in_playlist",
-        "extractor_args": {"youtube": {"lang": ["ja"]}},
+        "extractor_args": {"youtube": {"lang": ["ja"], "player_client": ["mweb"]}},
         # ライブ配信で"No video formats found!"エラーになることがある既知のyt-dlp側の問題への
         # 対策として、見つからない場合にエラーで落とさず、manifest_url(HLSのマスター
         # プレイリストURL)だけでも拾えるようにする。
@@ -2012,6 +2021,15 @@ def _extract_flat(url, playliststart=None, playlistend=None):
         # PO Tokenを検証されて弾かれる)ことが判明したため撤去した。Node.jsでの署名解読を
         # 正規に通ったフォーマットだけを使う方が、多少フォーマットの選択肢が減っても
         # 確実に再生できる。
+        #
+        # player_client を明示的に mweb に固定している理由:
+        # クライアントを指定せずyt-dlpの自動選択に任せると、Node.jsが使える状態でも
+        # 「android_vr」(取得直後から失効しているブラウザ非対応URL)や、HLS経由の
+        # 映像のみのフォーマットが優先的に選ばれてしまい、自作プレイヤーで正しく
+        # 再生できないことが実機検証で確認できた。mwebクライアントを明示指定した場合
+        # だけ、Node.jsでの署名解読(node --permission による安全な実行)が実際に
+        # 発動し、映像+音声が一体になった、ブラウザから直接再生できるURLが返って
+        # くることを確認済み(2026-08-10)。
         "ignore_no_formats_error": True,
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
