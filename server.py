@@ -203,6 +203,11 @@ def _cookie_header_string():
 
 
 RESPONSE_CACHE_TTL_SECONDS = int(os.environ.get("YTDLP_API_CACHE_TTL_SECONDS", str(7 * 3600)))
+# ストリームURL(実際の動画再生用URL)は、動画のタイトル等のメタデータと違って
+# YouTube側でもっと短い時間で失効する。上のRESPONSE_CACHE_TTL_SECONDS(既定7時間)を
+# そのまま流用すると、期限切れの再生できないURLをそのまま返し続けてしまうため、
+# stream()だけは短めのTTLを使う。
+STREAM_CACHE_TTL_SECONDS = int(os.environ.get("YTDLP_API_STREAM_CACHE_TTL_SECONDS", str(3 * 3600)))
 
 
 def _get_or_create_secret(env_var_name, file_name, length=48):
@@ -1598,7 +1603,15 @@ def _json_safe(obj):
     return json.loads(json.dumps(obj, default=str, ensure_ascii=False))
 
 
-def _response_cache_get(key):
+def _response_cache_get(key, ttl_seconds=None):
+    """
+    ttl_secondsを省略した場合は既定のRESPONSE_CACHE_TTL_SECONDS(検索結果・
+    チャンネル情報等、動画の実際の再生URLを含まないものに使う)。
+    ストリームURLはYouTube側でもっと短い時間で失効するため、stream()側からは
+    STREAM_CACHE_TTL_SECONDSという短めの値を渡している(呼び出し側で指定)。
+    """
+    if ttl_seconds is None:
+        ttl_seconds = RESPONSE_CACHE_TTL_SECONDS
     with _CACHE_DB_LOCK, _db() as conn:
         row = conn.execute(
             "SELECT payload, created_at FROM response_cache WHERE key = ?", (key,)
@@ -1606,13 +1619,13 @@ def _response_cache_get(key):
     if not row:
         return None
     age = time.time() - row["created_at"]
-    if age > RESPONSE_CACHE_TTL_SECONDS:
+    if age > ttl_seconds:
         return None
     payload = json.loads(row["payload"])
     payload["_cache"] = {
         "hit": True,
         "age_seconds": round(age, 1),
-        "expires_in_seconds": round(RESPONSE_CACHE_TTL_SECONDS - age, 1),
+        "expires_in_seconds": round(ttl_seconds - age, 1),
     }
     return payload
 
@@ -1627,6 +1640,8 @@ def _response_cache_set(key, kind, video_id, payload):
                 payload=excluded.payload,
                 created_at=excluded.created_at
         """, (key, kind, video_id, json.dumps(payload, ensure_ascii=False), now))
+        # 掃除は一番長い既定TTLを基準にする(短いTTL専用のレコードも、
+        # 既定TTLより古くなっていれば確実に消せるため)
         threshold = now - RESPONSE_CACHE_TTL_SECONDS
         conn.execute("DELETE FROM response_cache WHERE created_at < ?", (threshold,))
 
@@ -1783,11 +1798,16 @@ def _ydl_opts(extra=None, cookiefile_override=None):
         "noplaylist": True,
         "skip_download": True,
         "nocheckcertificate": True,
-        "extractor_args": {"youtube": {"lang": ["ja"], "formats": ["missing_pot"]}},
-        # ライブ配信で"No video formats found!"エラーになることがある既知のyt-dlp側の問題
-        # (PO Token絡みでフォーマットが弾かれてしまう)への対策。missing_potで弾かれた
-        # フォーマットも許可しつつ、それでも見つからない場合はエラーで落とさず、
-        # manifest_url(HLSのマスタープレイリストURL)だけでも拾えるようにする。
+        "extractor_args": {"youtube": {"lang": ["ja"]}},
+        # ライブ配信で"No video formats found!"エラーになることがある既知のyt-dlp側の問題への
+        # 対策として、見つからない場合にエラーで落とさず、manifest_url(HLSのマスター
+        # プレイリストURL)だけでも拾えるようにする。
+        # 注意: 以前はextractor_argsに formats: [missing_pot] を指定して、PO Token
+        # (認証トークン)が無いために本来は除外されるフォーマットも無理やり通していたが、
+        # そうやって通したフォーマットは取得した直後から実際には再生できない(CDN側で
+        # PO Tokenを検証されて弾かれる)ことが判明したため撤去した。Node.jsでの署名解読を
+        # 正規に通ったフォーマットだけを使う方が、多少フォーマットの選択肢が減っても
+        # 確実に再生できる。
         "ignore_no_formats_error": True,
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
@@ -1982,11 +2002,16 @@ def _extract_flat(url, playliststart=None, playlistend=None):
         "no_warnings": True,
         "nocheckcertificate": True,
         "extract_flat": "in_playlist",
-        "extractor_args": {"youtube": {"lang": ["ja"], "formats": ["missing_pot"]}},
-        # ライブ配信で"No video formats found!"エラーになることがある既知のyt-dlp側の問題
-        # (PO Token絡みでフォーマットが弾かれてしまう)への対策。missing_potで弾かれた
-        # フォーマットも許可しつつ、それでも見つからない場合はエラーで落とさず、
-        # manifest_url(HLSのマスタープレイリストURL)だけでも拾えるようにする。
+        "extractor_args": {"youtube": {"lang": ["ja"]}},
+        # ライブ配信で"No video formats found!"エラーになることがある既知のyt-dlp側の問題への
+        # 対策として、見つからない場合にエラーで落とさず、manifest_url(HLSのマスター
+        # プレイリストURL)だけでも拾えるようにする。
+        # 注意: 以前はextractor_argsに formats: [missing_pot] を指定して、PO Token
+        # (認証トークン)が無いために本来は除外されるフォーマットも無理やり通していたが、
+        # そうやって通したフォーマットは取得した直後から実際には再生できない(CDN側で
+        # PO Tokenを検証されて弾かれる)ことが判明したため撤去した。Node.jsでの署名解読を
+        # 正規に通ったフォーマットだけを使う方が、多少フォーマットの選択肢が減っても
+        # 確実に再生できる。
         "ignore_no_formats_error": True,
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
@@ -4384,7 +4409,7 @@ def proxy_stream(video_id):
 @app.get("/api/stream/<video_id>")
 def stream(video_id):
     key = f"stream:{video_id}"
-    cached = _response_cache_get(key)
+    cached = _response_cache_get(key, ttl_seconds=STREAM_CACHE_TTL_SECONDS)
     if cached is not None:
         return jsonify(cached)
 
@@ -4422,7 +4447,7 @@ def stream(video_id):
     result["_cache"] = {
         "hit": False,
         "age_seconds": 0,
-        "expires_in_seconds": RESPONSE_CACHE_TTL_SECONDS,
+        "expires_in_seconds": STREAM_CACHE_TTL_SECONDS,
     }
     return jsonify(result)
 
