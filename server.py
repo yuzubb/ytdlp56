@@ -3,7 +3,8 @@ ytdlp_api - yt-dlp を使ったシンプルな動画情報/ストリーム一覧
 UIなし(/api/statsのみUIあり)、API専用。Termux + ngrok での運用を想定。
 
 Flask + requests のみで構成(fastapi/pydanticは不使用。Rustビルド不要)。
-ffmpegも不要(HLSリアルタイム変換機能は廃止し、yt-dlpが把握しているm3u8直リンクのみ返す構成)。
+ffmpegが必要(/api/muxed-streamで、映像のみフォーマットと音声の結合、および
+HLS(m3u8)のMP4変換をその場で行う。一時ファイルは作らずパイプ経由でストリーミング)。
 
 エンドポイント:
   GET    /api                                  API一覧・説明・実行テスト用ページ(HTML)
@@ -15,6 +16,8 @@ ffmpegも不要(HLSリアルタイム変換機能は廃止し、yt-dlpが把握�
   GET    /api/trending                          このサイトで実際に視聴された動画のランキング
   GET    /api/info/{video_id}                 動画の全メタデータ(ストリームURLは含まない)
   GET    /api/stream/{video_id}                その動画の全ストリームURL一覧 + HLS(m3u8)直リンク(あれば)
+  GET    /api/muxed-stream/{video_id}          format_id指定のフォーマットを種類に応じて自動判別配信(結合/HLS変換/単純中継)
+  GET    /api/m3u8/{video_id}                  HLS(m3u8)専用。他のエンドポイントに依存しない独立実装。FFmpegでMP4変換して配信
   GET    /api/health                           死活監視
   GET    /api/stats                            worker/処理中/キャッシュ/稼働時間を見るダッシュボード(HTML)
   GET    /api/stats/data                       ↑と同じ内容をJSONで返す(ポーリング用)
@@ -62,6 +65,7 @@ import gzip
 import zlib
 import sqlite3
 import threading
+import subprocess
 import concurrent.futures
 import urllib.parse
 import urllib.request
@@ -1798,7 +1802,7 @@ def _ydl_opts(extra=None, cookiefile_override=None):
         "noplaylist": True,
         "skip_download": True,
         "nocheckcertificate": True,
-        "extractor_args": {"youtube": {"lang": ["ja"], "player_client": ["mweb"]}},
+        "extractor_args": {"youtube": {"lang": ["ja"], "player_client": ["web_embedded"]}},
         # ライブ配信で"No video formats found!"エラーになることがある既知のyt-dlp側の問題への
         # 対策として、見つからない場合にエラーで落とさず、manifest_url(HLSのマスター
         # プレイリストURL)だけでも拾えるようにする。
@@ -1809,14 +1813,18 @@ def _ydl_opts(extra=None, cookiefile_override=None):
         # 正規に通ったフォーマットだけを使う方が、多少フォーマットの選択肢が減っても
         # 確実に再生できる。
         #
-        # player_client を明示的に mweb に固定している理由:
+        # player_client を明示的に web_embedded に固定している理由:
         # クライアントを指定せずyt-dlpの自動選択に任せると、Node.jsが使える状態でも
         # 「android_vr」(取得直後から失効しているブラウザ非対応URL)や、HLS経由の
         # 映像のみのフォーマットが優先的に選ばれてしまい、自作プレイヤーで正しく
-        # 再生できないことが実機検証で確認できた。mwebクライアントを明示指定した場合
-        # だけ、Node.jsでの署名解読(node --permission による安全な実行)が実際に
-        # 発動し、映像+音声が一体になった、ブラウザから直接再生できるURLが返って
-        # くることを確認済み(2026-08-10)。
+        # 再生できないことが実機検証で確認できた。
+        # 最初は mweb を使っていたが、mwebはGVS PO Token(追加の認証トークン)が
+        # 無いとhttps系の高画質フォーマットが軒並み弾かれてしまい、combined
+        # フォーマット(音声+映像一体)である360p(itag 18)しか選べなくなっていた。
+        # web_embedded クライアントであれば、PO Tokenが無くても144p〜1080pまでの
+        # video-only/audio-onlyフォーマットが取得できることを実機検証で確認できた
+        # (2026-08-10)。うちの自作プレイヤーはvideo-only+audio-onlyの同期再生に
+        # 対応しているので、これで実質的に高画質選択が可能になる。
         "ignore_no_formats_error": True,
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
@@ -1866,6 +1874,27 @@ def _handle_api_error(err):
     return jsonify({"detail": err.message, "code": err.code}), err.status_code
 
 
+@app.errorhandler(Exception)
+def _handle_unexpected_error(err):
+    """
+    ApiErrorとして想定していなかった例外(バグ・想定外のケース)が起きた場合、
+    Flaskの既定の生HTML 500エラーページ(Werkzeugのデバッグ画面や素っ気ない
+    定型文)がそのまま返ってしまうと、フロントエンド側で内容を判別できず
+    扱いに困る。必ずJSON形式で返すようにする。
+    """
+    # HTTPException(404 Not Found等、Flask/Werkzeugが投げる正規のもの)は
+    # そのまま元のステータスコードを尊重しつつJSON化する。
+    from werkzeug.exceptions import HTTPException
+    if isinstance(err, HTTPException):
+        status_code = err.code or 500
+        message = err.description or str(err)
+    else:
+        status_code = 500
+        message = f"予期しないエラーが発生しました: {err}"
+        log("access", f"未処理の例外: {err!r}", "red")
+    return jsonify({"detail": message, "code": "UNEXPECTED_ERROR"}), status_code
+
+
 _NETWORK_ERROR_HINTS = (
     "urlopen error", "connection refused", "network is unreachable",
     "temporary failure in name resolution", "timed out", "timeout",
@@ -1905,6 +1934,13 @@ def _looks_like_auth_or_format_error(message):
 _NODE_EXTRACT_MAX_CONCURRENT = 3
 _NODE_EXTRACT_SEMAPHORE = threading.Semaphore(_NODE_EXTRACT_MAX_CONCURRENT)
 _NODE_EXTRACT_WAIT_TIMEOUT_SEC = 90
+
+# FFmpegでの映像+音声結合・HLS(m3u8)→MP4変換も、Node.jsと同様に重い処理なので
+# 同時実行数を制限する(一時ファイルは作らず、その場でパイプ経由にストリーミング
+# するため、ディスクは使わないがCPUは使う)。
+_FFMPEG_MAX_CONCURRENT = 3
+_FFMPEG_SEMAPHORE = threading.Semaphore(_FFMPEG_MAX_CONCURRENT)
+_FFMPEG_WAIT_TIMEOUT_SEC = 90
 
 
 def _extract(source_url, extra_opts=None, retries=2, retry_delay=1.5, max_cookie_attempts=None, use_cookies=True):
@@ -2011,7 +2047,7 @@ def _extract_flat(url, playliststart=None, playlistend=None):
         "no_warnings": True,
         "nocheckcertificate": True,
         "extract_flat": "in_playlist",
-        "extractor_args": {"youtube": {"lang": ["ja"], "player_client": ["mweb"]}},
+        "extractor_args": {"youtube": {"lang": ["ja"], "player_client": ["web_embedded"]}},
         # ライブ配信で"No video formats found!"エラーになることがある既知のyt-dlp側の問題への
         # 対策として、見つからない場合にエラーで落とさず、manifest_url(HLSのマスター
         # プレイリストURL)だけでも拾えるようにする。
@@ -2022,14 +2058,18 @@ def _extract_flat(url, playliststart=None, playlistend=None):
         # 正規に通ったフォーマットだけを使う方が、多少フォーマットの選択肢が減っても
         # 確実に再生できる。
         #
-        # player_client を明示的に mweb に固定している理由:
+        # player_client を明示的に web_embedded に固定している理由:
         # クライアントを指定せずyt-dlpの自動選択に任せると、Node.jsが使える状態でも
         # 「android_vr」(取得直後から失効しているブラウザ非対応URL)や、HLS経由の
         # 映像のみのフォーマットが優先的に選ばれてしまい、自作プレイヤーで正しく
-        # 再生できないことが実機検証で確認できた。mwebクライアントを明示指定した場合
-        # だけ、Node.jsでの署名解読(node --permission による安全な実行)が実際に
-        # 発動し、映像+音声が一体になった、ブラウザから直接再生できるURLが返って
-        # くることを確認済み(2026-08-10)。
+        # 再生できないことが実機検証で確認できた。
+        # 最初は mweb を使っていたが、mwebはGVS PO Token(追加の認証トークン)が
+        # 無いとhttps系の高画質フォーマットが軒並み弾かれてしまい、combined
+        # フォーマット(音声+映像一体)である360p(itag 18)しか選べなくなっていた。
+        # web_embedded クライアントであれば、PO Tokenが無くても144p〜1080pまでの
+        # video-only/audio-onlyフォーマットが取得できることを実機検証で確認できた
+        # (2026-08-10)。うちの自作プレイヤーはvideo-only+audio-onlyの同期再生に
+        # 対応しているので、これで実質的に高画質選択が可能になる。
         "ignore_no_formats_error": True,
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
@@ -4357,6 +4397,106 @@ def _resolve_direct_url(video_id, format_id, use_cache=True):
     return stream_url
 
 
+_HLS_PROTOCOLS = ("m3u8", "m3u8_native")
+
+
+def _ffmpeg_pipe_response(cmd, as_download=False, filename=None):
+    """
+    FFmpegコマンドを実行し、標準出力をそのまま少しずつ(パイプ経由で)レスポンスとして
+    流す。一時ファイルには一切書き出さない。同時実行数は_FFMPEG_MAX_CONCURRENTまでに
+    制限され、それを超える場合は枠が空くまで最大_FFMPEG_WAIT_TIMEOUT_SEC秒待機する。
+    """
+    acquired = _FFMPEG_SEMAPHORE.acquire(timeout=_FFMPEG_WAIT_TIMEOUT_SEC)
+    if not acquired:
+        raise ApiError(503, "サーバーが混み合っています(結合処理待ち)。しばらくしてから再度お試しください。", code="SERVER_BUSY")
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        _FFMPEG_SEMAPHORE.release()
+        raise ApiError(500, "ffmpegが見つかりません。サーバーにffmpegをインストールしてください。", code="FFMPEG_NOT_FOUND")
+
+    def generate():
+        try:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+            _FFMPEG_SEMAPHORE.release()
+
+    headers = {"Content-Type": "video/mp4"}
+    if as_download:
+        headers["Content-Disposition"] = f'attachment; filename="{filename or "video.mp4"}"'
+    return Response(generate(), headers=headers)
+
+
+def _stream_merged(video_url, audio_url, as_download=False, filename=None):
+    """
+    映像URLと音声URLを、一時ファイルに書き出さずFFmpegでその場で結合し、
+    結果を少しずつ(パイプ経由で)そのままレスポンスとして流す。
+    -c copy なので再エンコードはせず、コンテナだけ組み替える(高速・低負荷)。
+    frag_keyframe+empty_moov は、ファイル末尾に来るはずのmoovアトム(メタデータ)を
+    先頭に置けない代わりに、断片化MP4にすることでシーク無しでもストリーミング
+    再生できるようにするためのオプション。
+    """
+    cmd = [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-i", video_url,
+        "-i", audio_url,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c", "copy",
+        "-f", "mp4",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "pipe:1",
+    ]
+    return _ffmpeg_pipe_response(cmd, as_download=as_download, filename=filename)
+
+
+def _stream_hls(hls_url, as_download=False, filename=None):
+    """
+    HLS(m3u8)のマスタープレイリストURLを、一時ファイルに書き出さずFFmpegで
+    セグメントを結合しながらMP4コンテナに変換し、その場でレスポンスとして流す。
+    HLSのTSセグメントに入っている音声(ADTS形式)をMP4対応形式に変換するため、
+    -bsf:a aac_adtstoasc を付けている(無いと音声が正しく入らないことがある)。
+    """
+    cmd = [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-i", hls_url,
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        "-f", "mp4",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "pipe:1",
+    ]
+    return _ffmpeg_pipe_response(cmd, as_download=as_download, filename=filename)
+
+
+def _best_audio_format(formats):
+    """formats一覧の中から、一番ビットレートの高い音声のみフォーマットを選ぶ。"""
+    audio_only = [
+        f for f in formats
+        if f.get("url") and (f.get("vcodec") in (None, "none")) and f.get("acodec") not in (None, "none")
+    ]
+    if not audio_only:
+        return None
+    audio_only.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0, reverse=True)
+    return audio_only[0]
+
+
 @app.get("/api/proxy-stream/<video_id>")
 def proxy_stream(video_id):
     """
@@ -4422,6 +4562,206 @@ def proxy_stream(video_id):
 
     status_code = 206 if range_header and "Content-Range" in upstream.headers else upstream.status_code
     return Response(gen(), status=status_code, headers=passthrough_headers)
+
+
+def _ydl_opts_m3u8(cookiefile_override=None):
+    """
+    /api/m3u8 専用の、_ydl_opts() とは完全に独立したオプション生成関数。
+
+    通常の_ydl_opts()は player_client を "web_embedded" に固定しているが、
+    web_embeddedはHLS(m3u8)フォーマットを一切返さないことが実機検証で判明した
+    (https系のvideo-only/audio-onlyしか無い)。一方、player_clientを指定せず
+    yt-dlp自身の自動選択に任せた場合は、Node.jsが使える状態でHLS経由の
+    フォーマット(hlsnative)が選ばれることを実機検証で確認できている。
+    そのため、このm3u8専用のオプションでは player_client を指定しない。
+
+    通常の_extract()/_ydl_opts()には一切依存しない、完全に独立した実装
+    (どちらかに手を加えても、もう片方には影響しない)。
+    """
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "nocheckcertificate": True,
+        "extractor_args": {"youtube": {"lang": ["ja"]}},
+        "ignore_no_formats_error": True,
+        "js_runtimes": {"node": {}},
+        "remote_components": ["ejs:github"],
+        "http_headers": {
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+            "Sec-Ch-Ua": _PAGE_HEADERS["Sec-Ch-Ua"],
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+        },
+    }
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
+    chosen_cookiefile = cookiefile_override if cookiefile_override is not None else COOKIES_FILE_PATH
+    if chosen_cookiefile and os.path.isfile(chosen_cookiefile):
+        opts["cookiefile"] = chosen_cookiefile
+    return opts
+
+
+def _extract_m3u8(source_url):
+    """
+    /api/m3u8 専用の抽出関数。通常の_extract()とは別に、同じ考え方
+    (Node.js同時実行数の制限、ネットワークエラー時のリトライ)だけを踏襲した
+    独立実装。Cookieの複数ファイル切り替えまでは行わない(m3u8専用パスは
+    シンプルさを優先するため、1つのCookie設定のみを試す)。
+    """
+    acquired = _NODE_EXTRACT_SEMAPHORE.acquire(timeout=_NODE_EXTRACT_WAIT_TIMEOUT_SEC)
+    if not acquired:
+        raise ApiError(503, "サーバーが混み合っています。しばらくしてから再度お試しください。", code="SERVER_BUSY")
+
+    try:
+        last_error = None
+        for attempt in range(3):
+            try:
+                with yt_dlp.YoutubeDL(_ydl_opts_m3u8()) as ydl:
+                    return ydl.extract_info(source_url, download=False)
+            except yt_dlp.utils.DownloadError as e:
+                message = str(e)
+                last_error = message
+                if _looks_like_network_error(message) and attempt < 2:
+                    time.sleep(1.5)
+                    continue
+                raise ApiError(400, f"yt-dlp error: {message}", code="EXTRACTION_FAILED")
+        raise ApiError(503, f"ネットワーク接続が不安定です。しばらくしてから再度お試しください: {last_error}", code="NETWORK_UNSTABLE")
+    finally:
+        _NODE_EXTRACT_SEMAPHORE.release()
+
+
+@app.get("/api/m3u8/<video_id>")
+def m3u8_stream(video_id):
+    """
+    HLS(m3u8)専用の、完全に独立したエンドポイント。/api/muxed-streamや
+    /api/proxy-streamなど、他のエンドポイントの関数は一切呼び出さない
+    (他のエンドポイントの不具合の影響を受けないようにするため)。
+
+    HLS(m3u8)は、実機検証の結果、主にライブ配信(または配信アーカイブ)で
+    提供される形式であることが分かっている。通常のアップロード動画では
+    HLSが存在しないことが多い(その場合は404 NOT_FOUND_HLSを返す。
+    /api/muxed-stream等、https系フォーマットの利用を検討してほしい)。
+
+    指定した動画の中で一番画質の良いHLSフォーマットを自動選択し、FFmpegで
+    その場でMP4に変換して配信する(一時ファイルは作らない)。
+    ?format_id=91 のように指定すると、その画質をピンポイントで選べる
+    (どんなformat_idがあるか確認したい場合は、通常の/api/info等で先に
+    フォーマット一覧を見ておくとよい)。
+    ?download=1 でダウンロード用になる。
+    """
+    as_download = request.args.get("download", "0") == "1"
+
+    try:
+        source_url = _resolve_url(video_id)
+        data = _extract_m3u8(source_url)
+    except ApiError:
+        raise
+    except Exception as e:
+        log("access", f"/api/m3u8 抽出失敗(video_id={video_id}): {e!r}", "red")
+        raise ApiError(500, f"動画情報の取得に失敗しました: {e}", code="EXTRACTION_FAILED")
+
+    hls_formats = [
+        f for f in (data.get("formats") or [])
+        if (f.get("protocol") or "") in _HLS_PROTOCOLS and f.get("url")
+    ]
+    # 一覧の並び順は画質順とは限らない(実機確認では144pが先頭に来ることがあった)。
+    # 高さ(height)、無ければビットレート(tbr)で降順に並べ直し、一番良いものを選ぶ。
+    hls_formats.sort(key=lambda f: f.get("height") or f.get("tbr") or 0, reverse=True)
+
+    format_id = request.args.get("format_id", "").strip()
+    hls_url = None
+    if format_id:
+        # format_idを指定された場合は、その画質をピンポイントで選ぶ
+        for f in hls_formats:
+            if f.get("format_id") == format_id:
+                hls_url = f["url"]
+                break
+        if hls_url is None:
+            raise ApiError(404, f"指定されたformat_id({format_id})のHLSフォーマットが見つかりませんでした。", code="NOT_FOUND_HLS_FORMAT")
+    elif hls_formats:
+        hls_url = hls_formats[0]["url"]
+
+    if hls_url is None:
+        hls_url = data.get("manifest_url")
+    if not hls_url:
+        raise ApiError(
+            404,
+            "この動画にはHLS(m3u8)フォーマットが見つかりませんでした。"
+            "HLSは主にライブ配信(または配信アーカイブ)で提供される形式で、"
+            "通常のアップロード動画には無いことがあります。",
+            code="NOT_FOUND_HLS",
+        )
+
+    title = data.get("title") or video_id
+    safe_title = re.sub(r'[\\/:*?"<>|]', "_", title).strip()[:100] or video_id
+    filename = f"{safe_title}.mp4"
+
+    try:
+        return _stream_hls(hls_url, as_download=as_download, filename=filename)
+    except ApiError:
+
+        raise
+    except Exception as e:
+        log("access", f"/api/m3u8 変換失敗(video_id={video_id}): {e!r}", "red")
+        raise ApiError(500, f"HLSのMP4変換に失敗しました: {e}", code="FFMPEG_ERROR")
+
+
+@app.get("/api/muxed-stream/<video_id>")
+def muxed_stream(video_id):
+    """
+    format_id で指定したフォーマットを、種類に応じて自動判別して配信する。
+    一時ファイルは一切作らず、すべてFFmpegのパイプ経由でその場でストリーミングする。
+
+    - combined(映像+音声一体、例: itag 18)  → 追加処理不要なので/api/proxy-streamと同様に単純中継
+    - video-only(映像のみ、高画質)          → 一番良い音声を自動選択してFFmpegでその場で結合
+    - HLS(m3u8のマスタープレイリスト)        → FFmpegでその場でMP4に変換
+
+    ?download=1 を付けるとダウンロード用(Content-Disposition: attachment)になる。
+    """
+    format_id = request.args.get("format_id", "").strip()
+    if not format_id:
+        raise ApiError(400, "format_id is required", code="VALIDATION_FORMAT_ID_REQUIRED")
+    as_download = request.args.get("download", "0") == "1"
+
+    source_url = _resolve_url(video_id)
+    data = _extract(source_url)
+    formats = data.get("formats") or []
+
+    fmt = None
+    for f in formats:
+        if f.get("format_id") == format_id:
+            fmt = f
+            break
+    if not fmt or not fmt.get("url"):
+        raise ApiError(404, "指定されたフォーマットが見つかりません(既に有効期限切れの可能性があります)。", code="NOT_FOUND_FORMAT")
+
+    title = data.get("title") or video_id
+    safe_title = re.sub(r'[\\/:*?"<>|]', "_", title).strip()[:100] or video_id
+    filename = f"{safe_title}.mp4"
+
+    protocol = fmt.get("protocol") or ""
+    if protocol in _HLS_PROTOCOLS:
+        return _stream_hls(fmt["url"], as_download=as_download, filename=filename)
+
+    vcodec = fmt.get("vcodec") or "none"
+    acodec = fmt.get("acodec") or "none"
+
+    if vcodec != "none" and acodec != "none":
+        # 既に映像+音声が一体になっているフォーマットは、結合不要なのでそのまま
+        # /api/proxy-stream と同じロジックで中継する(format_id/downloadをそのまま渡す)。
+        return proxy_stream(video_id)
+
+    if vcodec == "none":
+        raise ApiError(400, "音声のみのフォーマットは視聴用としては選べません。/api/proxy-streamをご利用ください。", code="VALIDATION_AUDIO_ONLY_NOT_WATCHABLE")
+
+    # 映像のみのフォーマット: 一番良い音声を自動選択し、FFmpegでその場で結合する
+    audio = _best_audio_format(formats)
+    if not audio:
+        raise ApiError(500, "結合に使える音声フォーマットが見つかりませんでした。", code="EXTRACTION_NO_AUDIO_FOR_MUX")
+
+    return _stream_merged(fmt["url"], audio["url"], as_download=as_download, filename=filename)
 
 
 @app.get("/api/stream/<video_id>")
