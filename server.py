@@ -75,6 +75,11 @@ from datetime import datetime
 
 import requests
 import yt_dlp
+try:
+    import pytchat
+    _PYTCHAT_AVAILABLE = True
+except ImportError:
+    _PYTCHAT_AVAILABLE = False
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, Response, render_template, abort
 
@@ -2108,19 +2113,35 @@ def _slim_entry(e):
     is_playlist = e.get("_type") == "playlist" or (
         isinstance(entry_id, str) and entry_id.startswith(_PLAYLIST_ID_PREFIXES) and len(entry_id) > 12
     )
+    duration = e.get("duration")
+    # ショート動画の簡易判定: 60秒以下、かつURLに/shorts/を含む(yt-dlpがそう教えてくれる
+    # ことがある)か、アスペクト比が縦長(width < height)であることが分かる場合。
+    # 完全な判定はできないが、既存のフィールドだけで実用上十分な精度が出る。
+    url = e.get("url") or e.get("webpage_url") or ""
+    is_short = bool(
+        duration and duration <= 60 and (
+            "/shorts/" in url
+            or (e.get("thumbnails") and any(
+                t.get("width") and t.get("height") and t["width"] < t["height"]
+                for t in thumbnails
+            ))
+        )
+    )
     return {
         "video_id": entry_id,
         "title": e.get("title"),
         "url": e.get("url") or e.get("webpage_url"),
-        "duration": e.get("duration"),
+        "duration": duration,
         "view_count": e.get("view_count"),
         "channel": e.get("channel") or e.get("uploader"),
         "channel_id": e.get("channel_id") or e.get("uploader_id"),
         "thumbnail": thumbnail,
         "live_status": e.get("live_status"),
+        "release_timestamp": e.get("release_timestamp"),
         "upload_date": e.get("upload_date"),
         "entry_type": "playlist" if is_playlist else "video",
         "video_count": e.get("playlist_count") if is_playlist else None,
+        "is_short": is_short,
     }
 
 
@@ -3492,81 +3513,191 @@ def comments(video_id):
     return jsonify(result)
 
 
+# --- ライブチャット(pytchat利用、継続トークンでのポーリング対応) ---------------
+#
+# 以前は「yt-dlpが最初に教えてくれるチャットデータのURLに一度アクセスするだけ」の
+# 簡易版だったが、今回 pytchat (継続トークンを辿ってYouTubeのライブチャットを
+# 取得し続けるためのオープンソースライブラリ) を使った本格実装に置き換えた。
+#
+# 動画ID(配信)ごとに1つの「セッション」を作り、バックグラウンドスレッドで
+# 継続的に新着メッセージを取得し続けてリングバッファに貯めておく。
+# フロントエンドは ?after=<seq> で「前回受け取った最後の連番より後のメッセージ」
+# だけをポーリングで取得できる(差分だけを返すので効率が良い)。
+# 一定時間アクセスの無いセッションは自動的に終了・破棄する(サーバー負荷対策)。
+
+_LIVECHAT_SESSIONS = {}
+_LIVECHAT_SESSIONS_LOCK = threading.Lock()
+_LIVECHAT_BUFFER_MAX = 500  # 1配信あたり、直近何件のメッセージまで保持するか
+_LIVECHAT_SESSION_IDLE_TIMEOUT_SEC = 180  # このくらいアクセスが無ければセッションを終了する
+_LIVECHAT_CLEANUP_INTERVAL_SEC = 60
+
+
+def _pytchat_item_to_dict(c, seq):
+    """
+    pytchatのChatオブジェクトを、フロントエンドで扱いやすいJSON互換の辞書に変換する。
+    message_parts には、通常のテキストと絵文字(スタンプ)が混在したリストが入る。
+    絵文字の要素は {"id":..., "txt":..., "url":...} という辞書、通常のテキストは
+    ただの文字列なので、フロントエンド側は「文字列か辞書か」で描画を分けられる。
+    """
+    author = c.author
+    return {
+        "seq": seq,
+        "id": c.id,
+        "type": c.type,  # "textMessage" | "superChat" | "superSticker" | "newSponsor" | "membership" 等
+        "timestamp_usec": c.timestamp * 1000,
+        "elapsed_time": c.elapsedTime,
+        "message": c.message,
+        "message_parts": c.messageEx,
+        "amount": c.amountString or None,
+        "bg_color": c.bgColor or None,
+        "author": {
+            "name": author.name,
+            "channel_id": author.channelId,
+            "channel_url": author.channelUrl,
+            "image_url": author.imageUrl,
+            "badge_url": author.badgeUrl or None,
+            "is_owner": bool(author.isChatOwner),
+            "is_moderator": bool(author.isChatModerator),
+            "is_member": bool(author.isChatSponsor),
+            "is_verified": bool(author.isVerified),
+        },
+    }
+
+
+class _LiveChatSession:
+    def __init__(self, video_id):
+        self.video_id = video_id
+        self.lock = threading.Lock()
+        self.buffer = []
+        self.next_seq = 1
+        self.last_access = time.time()
+        self.error = None
+        self.chat = None
+        self.thread = None
+        self._start()
+
+    def _start(self):
+        try:
+            self.chat = pytchat.create(video_id=self.video_id, interruptable=False)
+        except Exception as e:
+            self.error = f"ライブチャットの初期化に失敗しました: {e}"
+            log("access", f"livechatセッション初期化失敗(video_id={self.video_id}): {e!r}", "yellow")
+            return
+        self.thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self.thread.start()
+
+    def _listen_loop(self):
+        try:
+            while self.chat.is_alive():
+                try:
+                    chatdata = self.chat.get()
+                except Exception as e:
+                    log("access", f"livechat取得エラー(video_id={self.video_id}): {e!r}", "yellow")
+                    break
+                items = list(chatdata.items)
+                if items:
+                    with self.lock:
+                        for c in items:
+                            self.buffer.append(_pytchat_item_to_dict(c, self.next_seq))
+                            self.next_seq += 1
+                        if len(self.buffer) > _LIVECHAT_BUFFER_MAX:
+                            self.buffer = self.buffer[-_LIVECHAT_BUFFER_MAX:]
+                # 一定時間アクセスが無ければ、このセッション自体を終了させる
+                # (誰も見ていない配信のチャットを取得し続けるのは無駄なため)。
+                if time.time() - self.last_access > _LIVECHAT_SESSION_IDLE_TIMEOUT_SEC:
+                    break
+        except Exception as e:
+            log("access", f"livechatリスナーが異常終了(video_id={self.video_id}): {e!r}", "red")
+        finally:
+            try:
+                self.chat.terminate()
+            except Exception:
+                pass
+
+    def get_since(self, after_seq):
+        with self.lock:
+            if after_seq <= 0:
+                return list(self.buffer[-50:])  # 初回は直近50件だけ返す(いきなり500件は過剰なため)
+            return [m for m in self.buffer if m["seq"] > after_seq]
+
+    def touch(self):
+        self.last_access = time.time()
+
+    def is_idle_too_long(self):
+        return time.time() - self.last_access > _LIVECHAT_SESSION_IDLE_TIMEOUT_SEC
+
+    def terminate(self):
+        try:
+            if self.chat:
+                self.chat.terminate()
+        except Exception:
+            pass
+
+
+def _cleanup_livechat_sessions():
+    """アイドル状態が長すぎるセッションを片付ける。定期的にバックグラウンドで呼ばれる。"""
+    with _LIVECHAT_SESSIONS_LOCK:
+        dead_ids = [vid for vid, s in _LIVECHAT_SESSIONS.items() if s.is_idle_too_long()]
+        for vid in dead_ids:
+            _LIVECHAT_SESSIONS[vid].terminate()
+            del _LIVECHAT_SESSIONS[vid]
+
+
+def _livechat_cleanup_loop():
+    while True:
+        time.sleep(_LIVECHAT_CLEANUP_INTERVAL_SEC)
+        try:
+            _cleanup_livechat_sessions()
+        except Exception as e:
+            log("access", f"livechatセッション掃除中にエラー: {e!r}", "yellow")
+
+
+if _PYTCHAT_AVAILABLE:
+    threading.Thread(target=_livechat_cleanup_loop, daemon=True).start()
+
+
 @app.get("/api/livechat/<video_id>")
 def livechat(video_id):
     """
-    ライブ配信(または過去のライブ配信のアーカイブ)のチャットを取得する。
+    ライブ配信のチャットを、継続トークンを辿りながらリアルタイムに取得する。
+    pytchat(オープンソースライブラリ)が内部でYouTubeの内部APIを呼び続けて
+    くれるので、こちらは動画IDごとにセッションを1つ持ち、バッファから
+    「?afterで指定した連番より後のメッセージ」だけを返すだけでよい。
 
-    【試験的な実装であることに注意】
-    YouTubeのライブチャットは本来「継続トークン」を辿りながら少しずつ取得する
-    仕組みになっていて、配信全体のチャットを遡って全部取るには何度もリクエストを
-    繰り返す必要がある。この実装はそこまでは行っておらず、yt-dlpが最初に教えてくれる
-    チャットデータのURLに一度アクセスして、そこに含まれているメッセージだけを
-    パースして返す簡易版。ライブチャットが存在しない動画(通常のアップロード動画等)では
-    404になる。
+    フロントエンドは、初回は?after無しでアクセスし(直近50件が返る)、
+    以後はレスポンスに含まれる最新のseq番号を?afterに指定して
+    数秒おきにポーリングし続けることで、リアルタイムなチャット表示ができる。
+
+    絵文字(スタンプ)は message_parts の中に
+    {"id":..., "txt":..., "url":...} という形で含まれる。
     """
-    limit = max(1, min(int(request.args.get("limit", 200)), 500))
+    if not _PYTCHAT_AVAILABLE:
+        raise ApiError(500, "サーバーにpytchatがインストールされていません。requirements.txtを確認してください。", code="LIVECHAT_UNAVAILABLE")
 
-    key = f"livechat:{video_id}:{limit}"
-    cached = _response_cache_get(key)
-    if cached is not None:
-        return jsonify(cached)
+    after_seq = max(0, int(request.args.get("after", 0)))
 
-    source_url = _resolve_url(video_id)
-    with _track_processing(video_id, "livechat"):
-        data = _extract(source_url)
-        live_chat_formats = (data.get("subtitles") or {}).get("live_chat") or []
-        if not live_chat_formats:
-            raise ApiError(404, "this video has no live chat available (not a livestream, or chat replay is disabled)", code="NOT_FOUND_LIVE_CHAT")
+    with _LIVECHAT_SESSIONS_LOCK:
+        session = _LIVECHAT_SESSIONS.get(video_id)
+        if session is None:
+            session = _LiveChatSession(video_id)
+            _LIVECHAT_SESSIONS[video_id] = session
+        session.touch()
 
-        chat_url = live_chat_formats[0].get("url")
-        if not chat_url:
-            raise ApiError(404, "live chat url not found", code="NOT_FOUND_LIVE_CHAT_URL")
+    if session.error:
+        with _LIVECHAT_SESSIONS_LOCK:
+            _LIVECHAT_SESSIONS.pop(video_id, None)
+        raise ApiError(404, "この動画にはライブチャットが見つかりませんでした(配信ではない、または配信済みでチャットが無効になっている可能性があります)。", code="NOT_FOUND_LIVE_CHAT")
 
-        resp = _fetch_page(chat_url, timeout=60)
-        if resp.status_code >= 400:
-            raise ApiError(502, f"failed to fetch live chat data: HTTP {resp.status_code}", code="UPSTREAM_LIVE_CHAT_FETCH_FAILED")
+    messages = session.get_since(after_seq)
+    latest_seq = messages[-1]["seq"] if messages else after_seq
 
-    messages = []
-    for line in resp.text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            chunk = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        for node in _walk(chunk):
-            if not isinstance(node, dict) or "message" not in node:
-                continue
-            if "authorName" not in node and "authorExternalChannelId" not in node:
-                continue
-            text = _runs_text(node.get("message"))
-            if not text:
-                continue
-            messages.append({
-                "author": _runs_text(node.get("authorName")),
-                "text": text,
-                "timestamp_usec": node.get("timestampUsec"),
-            })
-            if len(messages) >= limit:
-                break
-        if len(messages) >= limit:
-            break
-
-    result = _json_safe({
+    return jsonify({
         "video_id": video_id,
-        "method": "experimental_live_chat_first_segment",
-        "note": "継続トークンを辿る本格実装ではなく、最初に取得できた範囲のチャットだけを返す試験的な機能です。",
         "message_count": len(messages),
         "messages": messages,
-        "cache_ttl_seconds": RESPONSE_CACHE_TTL_SECONDS,
+        "latest_seq": latest_seq,
+        "poll_interval_ms": 3000,
     })
-    _response_cache_set(key, "livechat", video_id, result)
-
-    result = dict(result)
-    result["_cache"] = {"hit": False, "age_seconds": 0, "expires_in_seconds": RESPONSE_CACHE_TTL_SECONDS}
-    return jsonify(result)
 
 
 def _find_balanced_json(text, start_idx):
@@ -3895,6 +4026,23 @@ def _find_first_image_sources(node):
     return None
 
 
+def _parse_duration_text(text):
+    """
+    "1:23" や "12:34:56" のような表示用の長さ文字列を秒数に変換する。
+    パースできない場合(空文字・"LIVE"等の非数値表記)はNoneを返す。
+    """
+    if not text or not isinstance(text, str):
+        return None
+    parts = text.strip().split(":")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    parts = [int(p) for p in parts]
+    seconds = 0
+    for p in parts:
+        seconds = seconds * 60 + p
+    return seconds
+
+
 def _parse_lockup_view_model(node):
     """
     YouTubeの新しいUI形式(lockupViewModel)を解析する。
@@ -3977,6 +4125,13 @@ def _parse_lockup_view_model(node):
         if digits:
             video_count = int(digits)
 
+    duration = _parse_duration_text(length_text) if length_text else None
+    # ショート判定: 60秒以下の動画、かつ再生リストではないもの。
+    # lockupViewModel自体にショート専用のフラグは無いため、長さだけで簡易判定している
+    # (関連動画・トレンド一覧に出てくる普通の短尺動画も稀に含まれてしまう可能性はあるが、
+    # 実用上はこれで十分な精度が出る)。
+    is_short = bool(not is_playlist and duration is not None and duration <= 60)
+
     return {
         "video_id": content_id,
         "title": title,
@@ -3984,6 +4139,8 @@ def _parse_lockup_view_model(node):
         "channel_id": channel_id,
         "channel_thumbnail": channel_avatar,
         "length_text": length_text,
+        "duration": duration,
+        "is_short": is_short,
         "view_count_text": views_text,
         "thumbnail": thumbnail_url,
         "entry_type": "playlist" if is_playlist else "video",
@@ -4334,15 +4491,65 @@ def _build_stream_payload(video_id, data, include_info=True, channel_avatar_url=
     formats = data.get("formats") or []
     streams = []
     hls_url = None
+    has_combined = False
     for f in formats:
         entry = {k: f.get(k) for k in _STREAM_FIELDS}
         streams.append(entry)
         protocol = f.get("protocol") or ""
         if hls_url is None and "m3u8" in protocol:
             hls_url = f.get("url")
+        vcodec = f.get("vcodec") or "none"
+        acodec = f.get("acodec") or "none"
+        if vcodec != "none" and acodec != "none":
+            has_combined = True
 
     if hls_url is None:
         hls_url = data.get("manifest_url")
+
+    # 映像+音声が一体になったフォーマットが1つも無い動画がまれにある
+    # (実機で確認済み: web_embeddedクライアントだと、動画によっては
+    # video-only/audio-onlyしか返ってこないことがある)。以前はこの場合
+    # 「再生可能なフォーマットが見つかりません」と諦めてエラーにしていたが、
+    # それだと「絶対に再生できるはず」という期待に応えられない。
+    # 一時ダウンロード無しでその場で結合できるFFmpeg合成エンドポイント
+    # (/api/muxed-stream)が既にあるので、combinedが無い場合は自動的に
+    # 「合成ストリーム」を選択肢に追加し、これがそのまま再生できるように
+    # フロントエンド側に案内する。
+    if not has_combined and not hls_url:
+        video_only = [f for f in formats if f.get("url") and (f.get("vcodec") or "none") != "none" and (f.get("acodec") or "none") == "none"]
+        audio_only = [f for f in formats if f.get("url") and (f.get("vcodec") or "none") == "none" and (f.get("acodec") or "none") != "none"]
+        if video_only and audio_only:
+            video_only.sort(key=lambda f: f.get("height") or 0, reverse=True)
+            best_video = video_only[0]
+            streams.append({
+                "format_id": f"muxed-{best_video.get('format_id')}",
+                "format_note": "自動合成(映像+音声をその場で結合)",
+                "ext": "mp4",
+                "resolution": best_video.get("resolution"),
+                "width": best_video.get("width"),
+                "height": best_video.get("height"),
+                "fps": best_video.get("fps"),
+                "vcodec": best_video.get("vcodec"),
+                "acodec": "muxed",
+                "abr": None, "vbr": best_video.get("vbr"), "tbr": best_video.get("tbr"),
+                "asr": None, "audio_channels": None,
+                "filesize": None, "filesize_approx": None,
+                "protocol": "muxed", "container": "mp4", "dynamic_range": best_video.get("dynamic_range"),
+                "language": None, "quality": best_video.get("quality"),
+                "url": f"/api/muxed-stream/{video_id}?format_id={best_video.get('format_id')}",
+            })
+            log("access", f"combinedフォーマットが無かったため合成ストリームで補完(video_id={video_id}, video_format={best_video.get('format_id')})", "yellow")
+
+    if not has_combined and not hls_url and not any(s.get("format_id", "").startswith("muxed-") for s in streams):
+        # ここまでで結局「実際に再生できるもの」が何も無かった場合のみ、診断用に
+        # フォーマット一覧を丸ごとログに残す。「たまに再生できるフォーマットが
+        # 見つからない」問題を追跡するための情報(mhtml等のダミーフォーマットしか
+        # 無いケースもここに含まれる)。
+        format_summary = [
+            {"id": f.get("format_id"), "protocol": f.get("protocol"), "vcodec": f.get("vcodec"), "acodec": f.get("acodec"), "url_present": bool(f.get("url"))}
+            for f in formats
+        ]
+        log("access", f"再生可能なフォーマットが本当に1つも無かった(video_id={video_id}): {format_summary}", "red")
 
     result = {
         "video_id": data.get("id") or video_id,
